@@ -1,0 +1,22 @@
+# Runtime dependencies for Orbit's backend.
+# Installed by ./dev_start.sh (into .venv) and by the Dockerfile.
+# Versions below are the ones the baseline was verified against.
+
+fastapi>=0.115
+uvicorn[standard]>=0.32
+sqlalchemy[asyncio]>=2.0.36
+asyncpg>=0.30
+greenlet>=3.1
+alembic>=1.14
+psycopg2-binary>=2.9
+pydantic>=2.10
+pydantic-settings>=2.7
+python-dotenv>=1.0
+PyJWT[crypto]>=2.10
+bcrypt>=4.2,<5
+python-multipart>=0.0.20
+httpx>=0.28
+email-validator>=2.2
+icalendar>=6.1
+python-dateutil>=2.9
+stripe>=11.4
