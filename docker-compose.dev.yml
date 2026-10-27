@@ -1,0 +1,25 @@
+# Local Postgres for the Orbit backend.
+#
+# Host port 5433: 5432 is taken on this machine (an SSH tunnel) and 54322 by
+# the frontend's local Supabase. Keep in sync with DATABASE_URL in .env.
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: orbit-backend-postgres
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: orbit
+      POSTGRES_PASSWORD: orbit
+      POSTGRES_DB: orbit
+    volumes:
+      - orbit_backend_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orbit -d orbit"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  orbit_backend_pgdata:
