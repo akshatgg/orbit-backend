@@ -2,13 +2,13 @@
 
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.deps import require_admin, require_cron
 from app.cron.service import run_reminders
-from app.sources.service import refresh_all_sources
+from app.sources.service import start_refresh
 
 router = APIRouter(prefix="/cron", tags=["cron"])
 
@@ -25,19 +25,13 @@ async def reminders(
     return await run_reminders(db)
 
 
-@router.get("/refresh-sources")
-async def refresh_sources_cron(
-    db: AsyncSession = Depends(get_db),
-    _: None = Depends(require_cron)
-) -> dict[str, Any]:
-    """Refresh every enabled source from the cron secret."""
-    return await refresh_all_sources(db, "cron")
+@router.get("/refresh-sources", status_code=status.HTTP_202_ACCEPTED)
+async def refresh_sources_cron(_: None = Depends(require_cron)) -> dict[str, Any]:
+    """Start the nightly refresh of every enabled source (cron secret), in the background."""
+    return {"started": start_refresh("cron")}
 
 
-@router.post("/refresh-sources")
-async def refresh_sources_admin(
-    db: AsyncSession = Depends(get_db),
-    admin: dict = Depends(require_admin),
-) -> dict[str, Any]:
-    """Refresh every enabled source on an admin's request."""
-    return await refresh_all_sources(db, "manual")
+@router.post("/refresh-sources", status_code=status.HTTP_202_ACCEPTED)
+async def refresh_sources_admin(admin: dict = Depends(require_admin)) -> dict[str, Any]:
+    """Start a refresh of every enabled source on an admin's request, in the background."""
+    return {"started": start_refresh("manual")}

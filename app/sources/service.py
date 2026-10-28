@@ -1,46 +1,62 @@
-"""Source sync engine: fetch → plan → apply, plus expiry and duplicate detection.
+"""Source sync engine: fetch → plan → apply, plus tagging, covers, page details, expiry and
+duplicate detection.
 
-The rules mirror Orbit's TypeScript engine (src/lib/sources/engine.ts and
-sync-plan.ts). Orbit never auto-cancels: an event missing or cancelled upstream is
-only flagged for review, and only on the run where it first goes missing.
+A port of Orbit's TypeScript engine (`src/lib/sources/engine.ts` and `sync-plan.ts`). Orbit
+never auto-cancels: an event missing or cancelled upstream is only flagged for review, and
+only on the run where it first goes missing.
+
+The engine works in its own sessions, not a request's: every transaction it opens marks the
+connection as the trusted writer (`app.trusted`, see is_service()), and work is committed as
+it goes (the sync's writes, then tags and covers, then each page read), so partial progress
+survives a later failure exactly as it did with the TypeScript engine.
 """
 
+import asyncio
+import logging
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Sequence
-from urllib.parse import urlparse
+from typing import Any, AsyncIterator, Iterable, Sequence
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import event as sa_event
+from sqlalchemy import insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.connectors.base import ConnectorError, FetchedFeed
+from app.categories.models import Category
+from app.connectors import js, urls
+from app.connectors.base import FetchedFeed, error_message
 from app.connectors.registry import CONNECTORS
-from app.core.config import settings
+from app.connectors.timezone import local_day
+from app.core.database import AsyncSessionLocal, engine
 from app.events.models import Event
+from app.sources.classify import classify_event
+from app.sources.duplicates import certain_duplicate, find_duplicates, pair_key
+from app.sources.enrich import (
+    db_message,
+    enrich_imported_events,
+    enrich_luma_events,
+    enrich_meetup_events,
+)
+from app.sources.enrich_plan import ENRICH_BUDGET_MS, RUN_ENRICH_DEADLINE_MS, RunState
+from app.sources.interests import with_interests
 from app.sources.models import EventDuplicateDismissal, EventSource, SourceRun
+from app.sources.places import normalise_country
+from app.sources.repeats import group_repeats
+
+logger = logging.getLogger(__name__)
+
+PAGE = 1000
+CHUNK = 200
+DAY_MS = 24 * 60 * 60 * 1000
 
 SYNCED_FIELDS: tuple[str, ...] = (
-    "title",
-    "summary",
-    "description",
-    "starts_at",
-    "ends_at",
-    "timezone",
-    "format",
-    "venue_name",
-    "address",
-    "city",
-    "country",
-    "latitude",
-    "longitude",
-    "registration_mode",
-    "external_url",
-    "source_url",
-    "series_key",
+    "title", "summary", "description", "starts_at", "ends_at", "timezone", "format", "venue_name", "address",
+    "city", "country", "latitude", "longitude", "registration_mode", "external_url", "source_url", "series_key",
     "series_label",
 )
 
+# Synced fields a kind's feed doesn't really have, so updates leave them alone.
 SKIPPED_FIELDS: dict[str, tuple[str, ...]] = {
     "luma": ("description", "city"),
     "luma-discover": ("description", "city"),
@@ -49,6 +65,18 @@ SKIPPED_FIELDS: dict[str, tuple[str, ...]] = {
     "eventbrite": ("description",),
 }
 
+# Location fields Luma page reads fill in when the listing hides the place until you register.
+# A later sync never empties them again: only a real (non-empty) value from the listing replaces
+# what's stored. Deliberate divergence from the TypeScript engine (approved by Akshat), which
+# nulled them on every run so the same events were rewritten nightly.
+KEEP_FILLED_FIELDS: dict[str, tuple[str, ...]] = {
+    "luma": ("venue_name", "address", "latitude", "longitude"),
+    "luma-discover": ("venue_name", "address", "latitude", "longitude"),
+}
+
+# Kinds that read a platform's search or listing rather than a full calendar. Events drop out
+# of those lists while their pages stay up, so a run only adds and updates: it never flags an
+# event as missing (a cancellation the platform reports is still flagged).
 ADD_ONLY_KINDS = {"luma-discover", "meetup-search", "eventbrite", "fatsoma"}
 
 EXTERNAL_LABELS: dict[str, str] = {
@@ -63,28 +91,12 @@ EXTERNAL_LABELS: dict[str, str] = {
 
 LIVE_STATUSES = {"published", "draft"}
 
-_COUNTRY_NAMES = {
-    "united kingdom": "GB",
-    "great britain": "GB",
-    "uk": "GB",
-    "england": "GB",
-    "scotland": "GB",
-    "wales": "GB",
-    "ireland": "IE",
-    "united states": "US",
-    "usa": "US",
-    "united states of america": "US",
-    "india": "IN",
-    "france": "FR",
-    "germany": "DE",
-    "spain": "ES",
-    "italy": "IT",
-    "netherlands": "NL",
-    "canada": "CA",
-    "australia": "AU",
-    "singapore": "SG",
-    "united arab emirates": "AE",
-}
+EXISTING_COLUMNS = (
+    Event.id, Event.source_event_id, Event.title, Event.summary, Event.description, Event.starts_at, Event.ends_at,
+    Event.timezone, Event.format, Event.venue_name, Event.address, Event.city, Event.country, Event.latitude,
+    Event.longitude, Event.registration_mode, Event.external_url, Event.source_url, Event.series_key,
+    Event.series_label, Event.status, Event.needs_review, Event.duplicate_of, Event.last_verified_at,
+)
 
 
 def source_key(source_id: UUID | str) -> str:
@@ -101,317 +113,239 @@ def source_id_from_key(source: str | None) -> UUID | None:
         return None
 
 
-def _utc(value: Any) -> datetime | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        try:
-            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    if not isinstance(value, datetime):
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+def _ms(value: Any) -> int | None:
+    moment = js.to_datetime(value)
+    return js.to_ms(moment) if moment is not None else None
 
 
-def _zone(name: str | None) -> ZoneInfo:
-    try:
-        return ZoneInfo(name or settings.DEFAULT_TIMEZONE)
-    except Exception:
-        return ZoneInfo(settings.DEFAULT_TIMEZONE)
+# ─── Sync plan (sync-plan.ts) ─────────────────────────────────────────────────
+
+def provenance_url(event: dict[str, Any], feed_url: str) -> str | None:
+    """The event's own page, else the feed's site (never the full feed URL, which can hold a token)."""
+    if event.get("url"):
+        return event["url"]
+    parsed = urls.parse(feed_url or "")
+    return parsed.origin if parsed is not None else None
 
 
-def _local_day(value: datetime, tz_name: str | None) -> str:
-    return _utc(value).astimezone(_zone(tz_name)).date().isoformat()
-
-
-def normalise_country(value: Any) -> str | None:
-    if value is None:
-        return None
-    raw = str(value).strip()
-    if not raw:
-        return None
-    if len(raw) == 2 and raw.isalpha():
-        return raw.upper()
-    return _COUNTRY_NAMES.get(raw.lower())
-
-
-def provenance_url(event: dict[str, Any], feed_url: str | None) -> str | None:
-    """The event's own page, else the feed's origin (never a URL that may hold a token)."""
-    url = event.get("url")
-    if isinstance(url, str) and url.lower().startswith(("http://", "https://")):
-        return url
-    if not feed_url:
-        return None
-    try:
-        parsed = urlparse(feed_url)
-        if parsed.scheme and parsed.hostname:
-            return f"{parsed.scheme}://{parsed.hostname}"
-    except ValueError:
-        return None
-    return None
-
-
-def synced_fields(event: dict[str, Any], feed_url: str | None = None) -> dict[str, Any]:
-    """The fields a source owns on its events."""
+def synced_fields(event: dict[str, Any], feed_url: str) -> dict[str, Any]:
+    """The fields a source owns on its events. `country` only when the feed names a real one."""
     country = normalise_country(event.get("country"))
-    latitude = event.get("latitude")
-    longitude = event.get("longitude")
-    data: dict[str, Any] = {
-        "title": str(event.get("title") or "").strip()[:140],
-        "summary": (str(event["summary"])[:200] if event.get("summary") else None),
+    fields: dict[str, Any] = {
+        "title": event["title"],
+        "summary": event.get("summary"),
         "description": event.get("description"),
-        "starts_at": _utc(event.get("starts_at")),
-        "ends_at": _utc(event.get("ends_at")),
-        "timezone": event.get("timezone") or settings.DEFAULT_TIMEZONE,
-        "format": event.get("format") if event.get("format") in ("in_person", "online", "hybrid") else "in_person",
+        "starts_at": event["starts_at"],
+        "ends_at": event.get("ends_at"),
+        "timezone": event["timezone"],
+        "format": event["format"],
         "venue_name": event.get("venue_name"),
         "address": event.get("address"),
         "city": event.get("city"),
-        "latitude": float(latitude) if latitude is not None else None,
-        "longitude": float(longitude) if longitude is not None else None,
+    }
+    if country:
+        fields["country"] = country
+    fields.update({
+        "latitude": event.get("latitude"),
+        "longitude": event.get("longitude"),
         "registration_mode": "external" if event.get("url") else "none",
         "external_url": event.get("url"),
         "source_url": provenance_url(event, feed_url),
         "series_key": event.get("series_key"),
         "series_label": event.get("series_label"),
-    }
-    if country:
-        data["country"] = country
-    return data
+    })
+    return fields
+
+
+def build_insert_row(
+    event: dict[str, Any], source: dict[str, Any], now: datetime, category_id: Any = ...
+) -> dict[str, Any]:
+    """Row for an event Orbit hasn't seen before. The platform's price is only set here."""
+    row = synced_fields(event, source["url"])
+    row.setdefault("country", None)  # every row of a multi-row insert carries the same columns
+    price = event.get("price")
+    row.update({
+        "source": source_key(source["id"]),
+        "source_event_id": event["source_event_id"],
+        "external_label": EXTERNAL_LABELS.get(source.get("kind") or "ical", "View details"),
+        "organiser_id": source.get("default_organiser_id"),
+        "category_id": source.get("default_category_id") if category_id is ... else category_id,
+        "tags": list(source.get("default_tags") or []),
+        "price_min": price["min"] if price else None,
+        "price_max": price["max"] if price else None,
+        "currency": price["currency"] if price else "GBP",  # the column default
+        "status": "published",
+        "last_verified_at": now,
+    })
+    return row
+
+
+def _same_instant(a: Any, b: Any) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    return _ms(a) == _ms(b)
 
 
 def _same_coordinate(a: Any, b: Any) -> bool:
     if a is None or b is None:
         return a is None and b is None
-    try:
-        return abs(float(a) - float(b)) < 1e-6
-    except (TypeError, ValueError):
-        return a == b
+    return abs(js.number(a) - js.number(b)) < 1e-6
 
 
 def changed_fields(
-    existing: dict[str, Any], incoming: dict[str, Any], skip: Iterable[str] = ()
+    existing: dict[str, Any], incoming: dict[str, Any], skip: Iterable[str] = (), keep_filled: Iterable[str] = ()
 ) -> dict[str, Any]:
-    """Only the fields that actually changed."""
-    next_fields = {key: value for key, value in incoming.items() if key not in set(skip)}
+    """Only the fields that actually changed (empty when nothing did). `keep_filled` fields are
+    never emptied: an empty incoming value leaves a stored one alone."""
+    skipped = set(skip)
+    kept = set(keep_filled)
+    nxt = {k: v for k, v in incoming.items() if k not in skipped}
     if existing.get("registration_mode") == "tickets":
-        next_fields.pop("registration_mode", None)
-        next_fields.pop("external_url", None)
+        # An admin switched this event to Orbit tickets: leave registration alone.
+        nxt.pop("registration_mode", None)
+        nxt.pop("external_url", None)
     patch: dict[str, Any] = {}
-    for key, value in next_fields.items():
+    for key, value in nxt.items():
         current = existing.get(key)
+        if key in kept and (value is None or value == "") and current is not None and current != "":
+            continue
         if key in ("starts_at", "ends_at"):
-            same = _utc(current) == _utc(value)
+            same = _same_instant(current, value)
         elif key in ("latitude", "longitude"):
             same = _same_coordinate(current, value)
         else:
-            same = current == value
+            same = current == value and type(current) is type(value) or (current is None and value is None)
         if not same:
             patch[key] = value
     return patch
 
 
-def build_insert_row(
-    event: dict[str, Any], source: dict[str, Any], now: datetime, category_id: UUID | None | object = ...
-) -> dict[str, Any]:
-    """Row for an event Orbit hasn't seen before; prices are set only on insert."""
-    key = source_key(source["id"])
-    row = synced_fields(event, source.get("url"))
-    row.update(
-        {
-            "source": key,
-            "source_event_id": event["source_event_id"],
-            "external_label": EXTERNAL_LABELS.get(source.get("kind") or "ical", "View details"),
-            "organiser_id": source.get("default_organiser_id"),
-            "category_id": source.get("default_category_id") if category_id is ... else category_id,
-            "tags": list(source.get("default_tags") or []),
-            "cover_url": event.get("cover_url"),
-            "status": "published",
-            "needs_review": False,
-            "last_verified_at": now,
-            "created_at": now,
-            "updated_at": now,
-        }
-    )
-    # Executemany inserts need every row to carry the same keys.
-    row.setdefault("country", None)
-    row.setdefault("price_min", None)
-    row.setdefault("price_max", None)
-    row.setdefault("currency", settings.CURRENCY)
-    if event.get("price_min") is not None or event.get("price_max") is not None:
-        row["price_min"] = event.get("price_min")
-        row["price_max"] = event.get("price_max")
-        row["currency"] = event.get("currency") or settings.CURRENCY
-    return row
-
-
-def _rekey_map(
-    existing: Sequence[dict[str, Any]], incoming: Sequence[dict[str, Any]]
-) -> dict[tuple[str, datetime], dict[str, Any]]:
-    incoming_ids = {event["source_event_id"] for event in incoming}
-    by_series: dict[tuple[str, datetime], dict[str, Any]] = {}
-    for row in existing:
-        series = row.get("series_key")
-        source_event_id = row.get("source_event_id")
-        starts = _utc(row.get("starts_at"))
-        if series and source_event_id and source_event_id not in incoming_ids and starts is not None:
-            by_series[(series, starts)] = row
-    return by_series
-
-
 def plan_sync(
     existing: Sequence[dict[str, Any]],
     incoming: Sequence[dict[str, Any]],
-    now: datetime,
-    previous_run_started_at: datetime | None = None,
-    coverage: str | dict[str, Any] = "complete",
     *,
+    now: datetime,
+    feed_url: str,
+    previous_run_started_at: datetime | None,
     skip: Iterable[str] = (),
-    feed_url: str | None = None,
+    keep_filled: Iterable[str] = (),
+    coverage: str | dict[str, Any] = "complete",
 ) -> dict[str, list[Any]]:
-    """Diff one source's feed against its stored events, mirroring Orbit's rules."""
-    now = _utc(now) or datetime.now(timezone.utc)
-    previous = _utc(previous_run_started_at)
-    plan: dict[str, list[Any]] = {
-        "inserts": [],
-        "updates": [],
-        "unchanged": [],
-        "flags": [],
-        "unflags": [],
-    }
-    by_id = {row["source_event_id"]: row for row in existing if row.get("source_event_id")}
+    """Works out inserts / updates / unchanged / flags; events are matched by source_event_id."""
+    plan: dict[str, list[Any]] = {"inserts": [], "updates": [], "unchanged": [], "flagged": [], "unflagged": []}
+    now_ms = js.to_ms(now)
+    by_id = {e["source_event_id"]: e for e in existing if e.get("source_event_id")}
     seen_ids: set[str] = set()
-    series_map = _rekey_map(existing, incoming)
+    # A series date can change id upstream (Meetup gives unannounced dates a temporary id and a
+    # numeric one later). Same series + same start is the same date: re-key it.
+    incoming_ids = {e["source_event_id"] for e in incoming}
 
-    def was_seen_last_run(row: dict[str, Any]) -> bool:
-        if previous is None:
-            return True
-        verified = _utc(row.get("last_verified_at"))
-        return verified is not None and verified >= previous
+    def series_date(key: str, starts_at: Any) -> str:
+        return f"{key}|{_ms(starts_at)}"
 
-    def flag(row: dict[str, Any], reason: str) -> None:
-        if (
-            not row.get("needs_review")
-            and row.get("status") in LIVE_STATUSES
-            and was_seen_last_run(row)
-        ):
-            plan["flags"].append({"id": row["id"], "reason": reason})
+    by_series_date = {
+        series_date(e["series_key"], e["starts_at"]): e
+        for e in existing
+        if e.get("series_key") and e.get("source_event_id") and e["source_event_id"] not in incoming_ids
+    }
+    previous_ms = js.to_ms(previous_run_started_at) if previous_run_started_at else None
+
+    def was_seen_last_run(e: dict[str, Any]) -> bool:
+        return previous_ms is None or (_ms(e["last_verified_at"]) or 0) >= previous_ms
+
+    def flag(e: dict[str, Any], reason: str) -> None:
+        if not e.get("needs_review") and e.get("status") in LIVE_STATUSES and was_seen_last_run(e):
+            plan["flagged"].append({"id": e["id"], "reason": reason})
 
     for event in incoming:
-        source_event_id = event["source_event_id"]
-        if source_event_id in seen_ids:
+        if event["source_event_id"] in seen_ids:
             continue
-        seen_ids.add(source_event_id)
-        current = by_id.get(source_event_id)
+        seen_ids.add(event["source_event_id"])
+        current = by_id.get(event["source_event_id"])
         rekeyed = False
         if current is None and event.get("series_key"):
-            starts = _utc(synced_fields(event, feed_url).get("starts_at"))
-            if starts is not None:
-                current = series_map.get((event["series_key"], starts))
+            key = series_date(event["series_key"], event["starts_at"])
+            current = by_series_date.get(key)
             if current is not None:
                 rekeyed = True
                 seen_ids.add(current["source_event_id"])
-                series_map.pop((event["series_key"], starts), None)
-
+                by_series_date.pop(key, None)
         if event.get("cancelled"):
             if current is not None:
                 flag(current, "cancelled")
             continue
-
         if current is None:
             plan["inserts"].append(event)
             continue
-
+        # Flagged as missing or cancelled, but the source lists it again (as live): nothing to decide.
         if current.get("needs_review") and not current.get("duplicate_of"):
-            plan["unflags"].append(current["id"])
-
-        patch = changed_fields(current, synced_fields(event, feed_url), skip)
+            plan["unflagged"].append(current["id"])
+        patch = changed_fields(current, synced_fields(event, feed_url), skip, keep_filled)
         if rekeyed:
-            patch["source_event_id"] = source_event_id
+            patch["source_event_id"] = event["source_event_id"]
         if patch:
-            plan["updates"].append({"id": current["id"], "source_event_id": source_event_id, "patch": patch})
+            plan["updates"].append({"id": current["id"], "source_event_id": event["source_event_id"], "patch": patch})
         else:
             plan["unchanged"].append(current["id"])
 
-    # A flag on an event that has started is moot.
-    unflagged = set(plan["unflags"])
-    for row in existing:
-        starts = _utc(row.get("starts_at"))
-        if (
-            row.get("needs_review")
-            and not row.get("duplicate_of")
-            and row["id"] not in unflagged
-            and starts is not None
-            and starts <= now
-        ):
-            plan["unflags"].append(row["id"])
-            unflagged.add(row["id"])
+    # A flag on an event that has started is moot: there's nothing left to keep or take down.
+    unflagged = set(plan["unflagged"])
+    for e in existing:
+        if e.get("needs_review") and not e.get("duplicate_of") and e["id"] not in unflagged and (_ms(e["starts_at"]) or 0) <= now_ms:
+            plan["unflagged"].append(e["id"])
 
     if coverage == "sample":
         return plan
-
-    covered_until = (
-        _utc(coverage["until"]) if isinstance(coverage, dict) and coverage.get("until") else None
-    )
-    for row in existing:
-        source_event_id = row.get("source_event_id")
-        if not source_event_id or source_event_id in seen_ids:
+    covered_until = _ms(coverage["until"]) if isinstance(coverage, dict) else None
+    for e in existing:
+        if not e.get("source_event_id") or e["source_event_id"] in seen_ids:
             continue
-        starts = _utc(row.get("starts_at"))
-        if starts is None or starts <= now:
-            continue
+        starts = _ms(e["starts_at"]) or 0
+        if starts <= now_ms:
+            continue  # past events are expected to drop off
         if covered_until is not None and starts >= covered_until:
+            continue  # beyond what this fetch read
+        # Platforms drop an event from their listings on its own day: not news.
+        if local_day(starts, e.get("timezone")) == local_day(now_ms, e.get("timezone")):
+            if e.get("needs_review") and not e.get("duplicate_of") and e["id"] not in unflagged:
+                plan["unflagged"].append(e["id"])
             continue
-        if _local_day(starts, row.get("timezone")) == _local_day(now, row.get("timezone")):
-            if row.get("needs_review") and not row.get("duplicate_of") and row["id"] not in unflagged:
-                plan["unflags"].append(row["id"])
-                unflagged.add(row["id"])
-            continue
-        flag(row, "missing")
-
+        flag(e, "missing")
     return plan
 
 
-def _chunks(items: Sequence[Any], size: int = 500) -> Iterable[Sequence[Any]]:
+# ─── Sessions ─────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def engine_session() -> AsyncIterator[AsyncSession]:
+    """A session whose every transaction is the trusted writer (`app.trusted`), so the event
+    guards treat the engine as the service after each commit too (pitfall P1)."""
+    async with AsyncSessionLocal() as session:
+
+        @sa_event.listens_for(session.sync_session, "after_begin")
+        def _trust(_session: Any, _transaction: Any, connection: Any) -> None:
+            connection.exec_driver_sql("select set_config('app.trusted', 'on', true)")
+
+        yield session
+
+
+def _db_value(key: str, value: Any) -> Any:
+    if key in ("starts_at", "ends_at", "last_verified_at"):
+        return js.to_datetime(value)
+    return value
+
+
+def _db_row(row: dict[str, Any]) -> dict[str, Any]:
+    out = {k: _db_value(k, v) for k, v in row.items()}
+    for key in ("organiser_id", "category_id"):
+        if isinstance(out.get(key), str):
+            out[key] = UUID(out[key])
+    return out
+
+
+def _chunks(items: Sequence[Any], size: int = CHUNK) -> Iterable[Sequence[Any]]:
     for index in range(0, len(items), size):
         yield items[index : index + size]
-
-
-EXISTING_COLUMNS = (
-    Event.id,
-    Event.source_event_id,
-    Event.title,
-    Event.summary,
-    Event.description,
-    Event.starts_at,
-    Event.ends_at,
-    Event.timezone,
-    Event.format,
-    Event.venue_name,
-    Event.address,
-    Event.city,
-    Event.country,
-    Event.latitude,
-    Event.longitude,
-    Event.registration_mode,
-    Event.external_url,
-    Event.source_url,
-    Event.series_key,
-    Event.series_label,
-    Event.status,
-    Event.needs_review,
-    Event.duplicate_of,
-    Event.last_verified_at,
-)
-
-
-async def get_source(db: AsyncSession, source_id: UUID) -> EventSource | None:
-    return (
-        await db.execute(select(EventSource).where(EventSource.id == source_id))
-    ).scalar_one_or_none()
 
 
 async def _previous_ok_run(db: AsyncSession, source_id: UUID) -> datetime | None:
@@ -425,282 +359,439 @@ async def _previous_ok_run(db: AsyncSession, source_id: UUID) -> datetime | None
     ).scalar_one_or_none()
 
 
-def _error_text(errors: list[dict[str, Any]]) -> str:
-    for error in errors:
-        message = error.get("message")
-        if message:
-            return str(message)[:500]
-    return "Unknown error"
+async def _existing(db: AsyncSession, key: str) -> list[dict[str, Any]]:
+    rows = (await db.execute(select(*EXISTING_COLUMNS).where(Event.source == key).order_by(Event.id))).mappings()
+    return [dict(row) for row in rows]
+
+
+async def _savepoint(db: AsyncSession, statement: Any) -> Any:
+    async with db.begin_nested():
+        return await db.execute(statement)
+
+
+# ─── Tags and covers (engine.ts) ──────────────────────────────────────────────
+
+async def tag_interests(
+    db: AsyncSession, key: str, errors: list[dict[str, Any]], *, source_tags: list[str], hints: dict[str, list]
+) -> None:
+    """Adds the source's own tags and the interests each event is about. Only adds, never touches
+    an event whose tags an admin edited (tags_locked). Never raises."""
+    try:
+        rows = (
+            await db.execute(
+                select(Event.id, Event.source_event_id, Event.title, Event.summary, Event.description, Event.tags, Event.tags_locked)
+                .where(Event.source == key)
+                .order_by(Event.id)
+            )
+        ).mappings().all()
+    except Exception as exc:  # noqa: BLE001
+        errors.append({"message": f"Couldn't load events to tag interests: {db_message(exc)}"})
+        return
+    for row in rows:
+        if row["tags_locked"]:
+            continue
+        current = list(row["tags"] or [])
+        with_source = [*current, *[t for t in source_tags if t not in current]]
+        tags = with_interests({**row, "tags": with_source}, hints.get(row["source_event_id"] or "", []))
+        if len(tags) == len(current):
+            continue
+        try:
+            await _savepoint(db, update(Event).where(Event.id == row["id"], Event.source == key).values(tags=tags))
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"event": str(row["id"]), "message": f"Couldn't tag interests: {db_message(exc)}"})
+
+
+async def fill_covers(db: AsyncSession, key: str, events: list[dict[str, Any]], errors: list[dict[str, Any]]) -> None:
+    """Gives events without a cover the platform's own image from this fetch. Never raises."""
+    images = {e["source_event_id"]: e["image_url"] for e in events if e.get("image_url")}
+    if not images:
+        return
+    try:
+        bare = (
+            await db.execute(
+                select(Event.id, Event.source_event_id).where(Event.source == key, Event.cover_url.is_(None)).order_by(Event.id)
+            )
+        ).all()
+    except Exception as exc:  # noqa: BLE001
+        errors.append({"message": f"Couldn't load events to add images: {db_message(exc)}"})
+        return
+    for event_id, source_event_id in bare:
+        image = images.get(source_event_id or "")
+        if not image:
+            continue
+        try:
+            await _savepoint(
+                db,
+                update(Event).where(Event.id == event_id, Event.source == key, Event.cover_url.is_(None)).values(cover_url=image),
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"event": str(event_id), "message": f"Couldn't add the image: {db_message(exc)}"})
+
+
+# ─── One source ───────────────────────────────────────────────────────────────
+
+def _source_dict(row: EventSource) -> dict[str, Any]:
+    return {
+        "id": row.id, "name": row.name, "kind": row.kind, "url": row.url,
+        "default_organiser_id": row.default_organiser_id, "default_category_id": row.default_category_id,
+        "default_tags": list(row.default_tags or []), "permission_confirmed": row.permission_confirmed,
+        "auto_category": row.auto_category,
+    }
 
 
 async def run_source(
-    db: AsyncSession, source_id: UUID, trigger: str = "manual"
+    source_id: UUID,
+    trigger: str = "manual",
+    *,
+    now: datetime | None = None,
+    run: RunState | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Fetch one source and apply the diff. Never raises: failures are recorded on the run."""
-    started_at = datetime.now(timezone.utc)
+    """Fetch one source and apply the diff. Never raises: failures are recorded on the run.
+
+    `dry_run` fetches and plans only (no writes, no page reads, no run row) and returns the
+    plan, for checking what a run would change.
+    """
+    now = now or datetime.now(timezone.utc)
+    run = run or RunState(deadline=int(time.time() * 1000) + ENRICH_BUDGET_MS)
     errors: list[dict[str, Any]] = []
     summary: dict[str, Any] = {
-        "source_id": str(source_id),
-        "name": "",
-        "status": "error",
-        "found": 0,
-        "inserted": 0,
-        "updated": 0,
-        "unchanged": 0,
-        "flagged_missing": 0,
-        "enriched": 0,
-        "errors": errors,
+        "source_id": str(source_id), "name": "", "status": "error", "found": 0, "inserted": 0, "updated": 0,
+        "unchanged": 0, "flagged_missing": 0, "enriched": 0, "errors": errors,
     }
-    source: dict[str, Any] | None = None
-
-    try:
-        row = await get_source(db, source_id)
+    async with engine_session() as db:
+        row = (await db.execute(select(EventSource).where(EventSource.id == source_id))).scalar_one_or_none()
         if row is None:
             errors.append({"message": "Source not found"})
             return summary
-        source = {
-            "id": row.id,
-            "name": row.name,
-            "kind": row.kind,
-            "url": row.url,
-            "default_organiser_id": row.default_organiser_id,
-            "default_category_id": row.default_category_id,
-            "default_tags": list(row.default_tags or []),
-            "permission_confirmed": row.permission_confirmed,
-            "auto_category": row.auto_category,
-        }
+        source = _source_dict(row)
         summary["name"] = source["name"]
+        await db.commit()
 
-        if not source["permission_confirmed"]:
-            raise ConnectorError("Permission to use this feed hasn't been confirmed.")
-        connector = CONNECTORS.get(source["kind"])
-        if connector is None:
-            raise ConnectorError(f'No connector for "{source["kind"]}" sources.')
+        try:
+            if not source["permission_confirmed"]:
+                raise Exception("Permission to use this feed hasn't been confirmed.")
+            connector = CONNECTORS.get(source["kind"])
+            if connector is None:
+                raise Exception(f'No connector for "{source["kind"]}" sources.')
 
-        previous_run_started_at = await _previous_ok_run(db, source_id)
-        fetched: FetchedFeed = await connector.fetch(source)
-        errors.extend(fetched.errors[:50])
-        summary["found"] = len(fetched.events)
+            previous_run_started_at = await _previous_ok_run(db, source["id"])
+            await db.commit()  # no transaction stays open while the platform is read
+            fetched: FetchedFeed = await connector.fetch(source, now)
+            errors.extend(fetched.errors)
+            summary["found"] = len(fetched.events)
 
-        key = source_key(source_id)
-        existing = [
-            dict(row)
-            for row in (
-                await db.execute(select(*EXISTING_COLUMNS).where(Event.source == key))
-            ).mappings()
-        ]
-        coverage: str | dict[str, Any] = (
-            "sample" if source["kind"] in ADD_ONLY_KINDS else fetched.coverage
-        )
-        plan = plan_sync(
-            existing,
-            fetched.events,
-            started_at,
-            previous_run_started_at,
-            coverage,
-            skip=SKIPPED_FIELDS.get(source["kind"], ()),
-            feed_url=source["url"],
-        )
-
-        if plan["inserts"]:
-            rows = [build_insert_row(event, source, started_at) for event in plan["inserts"]]
-            await db.execute(insert(Event).values(rows))
-            summary["inserted"] = len(rows)
-
-        for change in plan["updates"]:
-            patch = dict(change["patch"])
-            patch["last_verified_at"] = started_at
-            patch["updated_at"] = started_at
-            result = await db.execute(
-                update(Event)
-                .where(Event.id == change["id"], Event.source == key)
-                .values(**patch)
+            key = source_key(source["id"])
+            # Same title at the same place on several dates = one series, even when the platform doesn't say so.
+            events = group_repeats(fetched.events, key)
+            existing = await _existing(db, key)
+            plan = plan_sync(
+                existing, events, now=now, feed_url=source["url"], previous_run_started_at=previous_run_started_at,
+                skip=SKIPPED_FIELDS.get(source["kind"], ()), keep_filled=KEEP_FILLED_FIELDS.get(source["kind"], ()),
+                # A search or listing only adds and updates: events that drop out of it are still on the platform.
+                coverage="sample" if source["kind"] in ADD_ONLY_KINDS else fetched.coverage,
             )
-            summary["updated"] += result.rowcount or 0
 
-        for ids in _chunks(plan["unchanged"]):
-            await db.execute(
-                update(Event)
-                .where(Event.id.in_(ids), Event.source == key)
-                .values(last_verified_at=started_at)
-            )
-            summary["unchanged"] += len(ids)
+            # Discovery feeds bring unrelated events: classify each new one by its own words,
+            # falling back to the source's default category when nothing is clear.
+            category_for: dict[str, Any] = {}
+            classified = 0
+            if source["auto_category"] and plan["inserts"]:
+                try:
+                    rules = [
+                        {"id": str(r.id), "name": r.name, "keywords": list(r.keywords or [])}
+                        for r in (await db.execute(select(Category).order_by(Category.sort_order))).scalars()
+                    ]
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"message": f"Couldn't load category keywords: {db_message(exc)}"})
+                    rules = []
+                for event in plan["inserts"]:
+                    match = classify_event(event, rules)["category_id"]
+                    if match:
+                        classified += 1
+                    category_for[event["source_event_id"]] = UUID(match) if match else source["default_category_id"]
+            summary["classified"] = classified
 
-        for ids in _chunks([flag["id"] for flag in plan["flags"]]):
-            await db.execute(
-                update(Event)
-                .where(Event.id.in_(ids), Event.source == key)
-                .values(needs_review=True, updated_at=started_at)
-            )
-            summary["flagged_missing"] += len(ids)
+            if dry_run:
+                summary["status"] = "ok"
+                summary["plan"] = {
+                    "inserts": [e["source_event_id"] for e in plan["inserts"]],
+                    "updates": [{"id": str(u["id"]), "source_event_id": u["source_event_id"], "fields": sorted(u["patch"]), "patch": u["patch"]} for u in plan["updates"]],
+                    "unchanged": len(plan["unchanged"]),
+                    "flagged": [{"id": str(f["id"]), "reason": f["reason"]} for f in plan["flagged"]],
+                    "unflagged": [str(i) for i in plan["unflagged"]],
+                    "existing": len(existing),
+                    "coverage": fetched.coverage,
+                }
+                summary["events"] = events
+                return summary
 
-        for ids in _chunks(plan["unflags"]):
+            await _apply_plan(db, source, key, plan, category_for, now, summary, errors)
+            await db.commit()
+
+            hints = {e["source_event_id"]: e.get("interest_hints") or [] for e in events}
+            await tag_interests(db, key, errors, source_tags=source["default_tags"], hints=hints)
+            await fill_covers(db, key, events, errors)
+            await db.commit()
+
+            if source["kind"] in ("luma", "luma-discover"):
+                summary["enriched"] = await enrich_luma_events(db, source, now=now, errors=errors, run=run)
+            elif source["kind"] in ("meetup", "meetup-search"):
+                summary["enriched"] = await enrich_meetup_events(db, source, now=now, errors=errors, run=run)
+            elif source["kind"] in ("eventbrite", "fatsoma"):
+                summary["enriched"] = await enrich_imported_events(db, source, now=now, errors=errors, run=run)
+            await db.commit()
+            summary["status"] = "ok"
+        except Exception as exc:  # noqa: BLE001 - the run records the failure
+            logger.warning("Source %s failed: %s", source_id, exc)
+            await db.rollback()
+            summary["status"] = "error"
+            errors.insert(0, {"message": error_message(exc)})
+
+        finished_at = datetime.now(timezone.utc)
+        try:
             await db.execute(
-                update(Event)
-                .where(
-                    Event.id.in_(ids),
-                    Event.source == key,
-                    Event.duplicate_of.is_(None),
+                insert(SourceRun).values(
+                    source_id=source["id"], trigger=trigger if trigger in ("cron", "manual") else "manual",
+                    started_at=now, finished_at=finished_at, status=summary["status"], found=summary["found"],
+                    inserted=summary["inserted"], updated=summary["updated"], unchanged=summary["unchanged"],
+                    flagged_missing=summary["flagged_missing"], enriched=summary["enriched"], errors=errors[:50],
                 )
-                .values(needs_review=False, updated_at=started_at)
             )
-
-        summary["status"] = "ok"
-    except Exception as exc:  # noqa: BLE001 - the run records the failure
-        errors.insert(0, {"message": str(exc) or exc.__class__.__name__})
-        summary["status"] = "error"
-        try:
+            await db.execute(
+                update(EventSource)
+                .where(EventSource.id == source["id"])
+                .values(
+                    last_run_at=finished_at,
+                    last_status=summary["status"],
+                    last_error=((errors[0].get("message") if errors else None) or "Unknown error")
+                    if summary["status"] == "error" else None,
+                )
+            )
+            await db.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Couldn't record the run of source %s", source_id)
             await db.rollback()
-        except Exception:  # noqa: BLE001
-            pass
-
-    if source is None:
-        return summary
-
-    finished_at = datetime.now(timezone.utc)
-    try:
-        await db.execute(
-            insert(SourceRun).values(
-                source_id=source_id,
-                trigger=trigger if trigger in ("cron", "manual") else "manual",
-                started_at=started_at,
-                finished_at=finished_at,
-                status=summary["status"],
-                found=summary["found"],
-                inserted=summary["inserted"],
-                updated=summary["updated"],
-                unchanged=summary["unchanged"],
-                flagged_missing=summary["flagged_missing"],
-                enriched=summary["enriched"],
-                errors=errors[:50],
-            )
-        )
-        await db.execute(
-            update(EventSource)
-            .where(EventSource.id == source_id)
-            .values(
-                last_run_at=finished_at,
-                last_status=summary["status"],
-                last_error=_error_text(errors) if summary["status"] == "error" else None,
-                updated_at=finished_at,
-            )
-        )
-    except Exception as exc:  # noqa: BLE001
-        summary["errors"].append({"message": f"Couldn't record the run: {exc}"})
-        try:
-            await db.rollback()
-        except Exception:  # noqa: BLE001
-            pass
+            errors.append({"message": f"Couldn't record the run: {db_message(exc)}"})
     return summary
 
 
+async def _apply_plan(
+    db: AsyncSession,
+    source: dict[str, Any],
+    key: str,
+    plan: dict[str, list[Any]],
+    category_for: dict[str, Any],
+    now: datetime,
+    summary: dict[str, Any],
+    errors: list[dict[str, Any]],
+) -> None:
+    # New events, a batch at a time; if a batch fails, retry row by row to isolate bad data.
+    for batch in _chunks(plan["inserts"]):
+        rows = [
+            _db_row(build_insert_row(e, source, now, category_for[e["source_event_id"]] if e["source_event_id"] in category_for else ...))
+            for e in batch
+        ]
+        try:
+            await _savepoint(db, insert(Event).values(rows))
+            summary["inserted"] += len(rows)
+            continue
+        except Exception:  # noqa: BLE001
+            pass
+        for event, row in zip(batch, rows):
+            try:
+                await _savepoint(db, insert(Event).values(**row))
+                summary["inserted"] += 1
+            except Exception as exc:  # noqa: BLE001
+                errors.append({"event": event["source_event_id"], "message": f"Not imported: {db_message(exc)}"})
+
+    for change in plan["updates"]:
+        values = {k: _db_value(k, v) for k, v in change["patch"].items()}
+        values["last_verified_at"] = now
+        try:
+            await _savepoint(db, update(Event).where(Event.id == change["id"], Event.source == key).values(**values))
+            summary["updated"] += 1
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"event": change["source_event_id"], "message": f"Not updated: {db_message(exc)}"})
+
+    for ids in _chunks(plan["unchanged"]):
+        try:
+            await _savepoint(db, update(Event).where(Event.id.in_(ids), Event.source == key).values(last_verified_at=now))
+            summary["unchanged"] += len(ids)
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"message": f"Couldn't mark events verified: {db_message(exc)}"})
+
+    for ids in _chunks([f["id"] for f in plan["flagged"]]):
+        try:
+            await _savepoint(db, update(Event).where(Event.id.in_(ids), Event.source == key).values(needs_review=True))
+            summary["flagged_missing"] += len(ids)
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"message": f"Couldn't flag missing events: {db_message(exc)}"})
+
+    for ids in _chunks(plan["unflagged"]):
+        try:
+            await _savepoint(
+                db,
+                update(Event).where(Event.id.in_(ids), Event.source == key, Event.duplicate_of.is_(None)).values(needs_review=False),
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"message": f"Couldn't clear review flags: {db_message(exc)}"})
+
+
+# ─── Expiry and duplicates ────────────────────────────────────────────────────
+
 async def expire_events(db: AsyncSession, now: datetime | None = None) -> int:
-    """Published events that ended more than a day ago become expired."""
+    """Published events that ended more than a day ago become "expired"."""
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(days=1)
     ended = await db.execute(
-        update(Event)
-        .where(Event.status == "published", Event.ends_at.is_not(None), Event.ends_at < cutoff)
-        .values(status="expired", updated_at=now)
+        update(Event).where(Event.status == "published", Event.ends_at < cutoff).values(status="expired")
     )
     no_end = await db.execute(
         update(Event)
         .where(Event.status == "published", Event.ends_at.is_(None), Event.starts_at < cutoff)
-        .values(status="expired", updated_at=now)
+        .values(status="expired")
     )
     return (ended.rowcount or 0) + (no_end.rowcount or 0)
 
 
-def _pair_key(a: Any, b: Any) -> tuple[str, str]:
-    first, second = sorted((str(a), str(b)))
-    return first, second
+_CANDIDATE_COLUMNS = (
+    Event.id, Event.title, Event.starts_at, Event.source, Event.created_at, Event.external_url,
+    Event.source_event_id, Event.format, Event.venue_name, Event.address,
+)
 
 
 async def detect_duplicates(db: AsyncSession, now: datetime | None = None) -> int:
-    """Flag published events sharing (lower(title), starts_at) and point them at the older row."""
+    """Flags new duplicates across every source (published, upcoming, not already linked)."""
     now = now or datetime.now(timezone.utc)
-    rows = (
-        await db.execute(
-            select(Event.id, Event.title, Event.starts_at, Event.created_at)
-            .where(Event.status == "published", Event.duplicate_of.is_(None))
-        )
-    ).mappings().all()
+    since = now - timedelta(days=1)
+    candidates = [
+        {**dict(row), "id": str(row["id"])}
+        for row in (
+            await db.execute(
+                select(*_CANDIDATE_COLUMNS)
+                .where(Event.status == "published", Event.duplicate_of.is_(None), Event.starts_at >= since)
+                .order_by(Event.starts_at)
+            )
+        ).mappings()
+    ]
     dismissals = (
-        await db.execute(
-            select(
-                EventDuplicateDismissal.event_id,
-                EventDuplicateDismissal.other_event_id,
-            )
-        )
-    ).mappings().all()
-    dismissed = {_pair_key(row["event_id"], row["other_event_id"]) for row in dismissals}
-
-    groups: dict[tuple[str, datetime], list[dict[str, Any]]] = {}
-    for row in rows:
-        starts = _utc(row["starts_at"])
-        if starts is None:
-            continue
-        groups.setdefault((str(row["title"]).strip().lower(), starts), []).append(dict(row))
-
+        await db.execute(select(EventDuplicateDismissal.event_id, EventDuplicateDismissal.other_event_id))
+    ).all()
+    dismissed = {pair_key(str(a), str(b)) for a, b in dismissals}
     flagged = 0
-    for group in groups.values():
-        if len(group) < 2:
-            continue
-        group.sort(key=lambda item: (_utc(item["created_at"]) or now, str(item["id"])))
-        keeper = group[0]
-        for candidate in group[1:]:
-            if _pair_key(keeper["id"], candidate["id"]) in dismissed:
-                continue
-            result = await db.execute(
+    for match in find_duplicates(candidates, dismissed):
+        try:
+            result = await _savepoint(
+                db,
                 update(Event)
-                .where(Event.id == candidate["id"], Event.duplicate_of.is_(None))
-                .values(duplicate_of=keeper["id"], needs_review=True, updated_at=now)
+                .where(Event.id == UUID(match["id"]), Event.duplicate_of.is_(None))
+                .values(duplicate_of=UUID(match["duplicate_of"]), needs_review=not match["exact"])
+                .returning(Event.id),
             )
-            flagged += result.rowcount or 0
+            flagged += len(result.all())
+        except Exception:  # noqa: BLE001 - as in TS, a failed update just isn't counted
+            pass
+    await settle_certain_duplicates(db, since)
     return flagged
 
 
-async def refresh_all_sources(
-    db: AsyncSession, trigger: str = "cron"
-) -> dict[str, Any]:
-    """Every enabled source in turn, then expiry and duplicate detection."""
+async def settle_certain_duplicates(db: AsyncSession, since: datetime) -> None:
+    """Takes certain duplicates (same title, start and place) out of the review queue."""
+    columns = (Event.id, Event.title, Event.starts_at, Event.format, Event.venue_name, Event.address, Event.duplicate_of)
+    try:
+        queued = [
+            dict(row)
+            for row in (
+                await db.execute(
+                    select(*columns)
+                    .where(Event.duplicate_of.is_not(None), Event.needs_review.is_(True), Event.starts_at >= since)
+                    .order_by(Event.id)
+                )
+            ).mappings()
+        ]
+        if not queued:
+            return
+        ids = list(dict.fromkeys(r["duplicate_of"] for r in queued))
+        originals: dict[Any, dict[str, Any]] = {}
+        for chunk in _chunks(ids):
+            for row in (await db.execute(select(*columns).where(Event.id.in_(chunk)))).mappings():
+                originals[row["id"]] = dict(row)
+        settled = [r["id"] for r in queued if r["duplicate_of"] in originals and certain_duplicate(originals[r["duplicate_of"]], r)]
+        for chunk in _chunks(settled):
+            await _savepoint(
+                db, update(Event).where(Event.id.in_(chunk), Event.duplicate_of.is_not(None)).values(needs_review=False)
+            )
+    except Exception:  # noqa: BLE001 - errors are swallowed, as in TS
+        logger.warning("Couldn't settle certain duplicates", exc_info=True)
+
+
+async def detect_duplicates_now(now: datetime | None = None) -> int:
+    """`detect_duplicates` in its own trusted session (after a single source run)."""
+    async with engine_session() as db:
+        flagged = await detect_duplicates(db, now)
+        await db.commit()
+        return flagged
+
+
+# ─── Refresh all ──────────────────────────────────────────────────────────────
+
+REFRESH_LOCK = "orbit:refresh-sources"
+
+
+async def refresh_all_sources(trigger: str = "cron") -> dict[str, Any]:
+    """The nightly job: every enabled source in turn (one failure never stops the rest), then
+    expiry and duplicate detection. Only one refresh runs at a time (a Postgres advisory lock)."""
     started_at = datetime.now(timezone.utc)
     errors: list[str] = []
     sources: list[dict[str, Any]] = []
-
-    source_ids = (
-        await db.execute(
-            select(EventSource.id)
-            .where(EventSource.enabled.is_(True))
-            .order_by(EventSource.created_at)
-        )
-    ).scalars().all()
-    for source_id in source_ids:
-        try:
-            sources.append(await run_source(db, source_id, trigger))
-            await db.commit()
-        except Exception as exc:  # noqa: BLE001 - one source never stops the rest
-            await db.rollback()
-            errors.append(f"Source {source_id}: {exc}")
-
     expired = 0
-    try:
-        expired = await expire_events(db)
-        await db.commit()
-    except Exception as exc:  # noqa: BLE001
-        await db.rollback()
-        errors.append(f"Expiry: {exc}")
-
     duplicates_flagged = 0
-    try:
-        duplicates_flagged = await detect_duplicates(db)
-        await db.commit()
-    except Exception as exc:  # noqa: BLE001
-        await db.rollback()
-        errors.append(f"Duplicate check: {exc}")
+    run = RunState(deadline=int(time.time() * 1000) + RUN_ENRICH_DEADLINE_MS)
 
-    return {
-        "ok": not errors and all(source["status"] == "ok" for source in sources),
+    # One connection holds the session-level lock for the whole refresh.
+    async with engine.connect() as lock:
+        locked = (await lock.execute(text("select pg_try_advisory_lock(hashtext(:k))"), {"k": REFRESH_LOCK})).scalar()
+        await lock.commit()
+        if not locked:
+            return {
+                "ok": False, "started_at": started_at.isoformat(), "finished_at": datetime.now(timezone.utc).isoformat(),
+                "sources": [], "expired": 0, "duplicates_flagged": 0, "errors": ["A refresh is already running."],
+            }
+        try:
+            try:
+                async with engine_session() as db:
+                    source_ids = (
+                        await db.execute(select(EventSource.id).where(EventSource.enabled.is_(True)).order_by(EventSource.created_at))
+                    ).scalars().all()
+            except Exception as exc:  # noqa: BLE001
+                source_ids = []
+                errors.append(f"Couldn't list sources: {db_message(exc)}")
+            for source_id in source_ids:
+                try:
+                    sources.append(await run_source(source_id, trigger, run=run))
+                except Exception as exc:  # noqa: BLE001 - one source never stops the rest
+                    errors.append(f"Source {source_id}: {error_message(exc)}")
+
+            async with engine_session() as db:
+                try:
+                    expired = await expire_events(db)
+                    await db.commit()
+                except Exception as exc:  # noqa: BLE001
+                    await db.rollback()
+                    errors.append(f"Expiry: {db_message(exc)}")
+                try:
+                    duplicates_flagged = await detect_duplicates(db)
+                    await db.commit()
+                except Exception as exc:  # noqa: BLE001
+                    await db.rollback()
+                    errors.append(f"Duplicate check: {db_message(exc)}")
+        finally:
+            await lock.execute(text("select pg_advisory_unlock(hashtext(:k))"), {"k": REFRESH_LOCK})
+            await lock.commit()
+
+    summary = {
+        "ok": not errors and all(s["status"] == "ok" for s in sources),
         "started_at": started_at.isoformat(),
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "sources": sources,
@@ -708,3 +799,28 @@ async def refresh_all_sources(
         "duplicates_flagged": duplicates_flagged,
         "errors": errors,
     }
+    logger.info(
+        "Source refresh (%s) finished: ok=%s sources=%d expired=%d duplicates=%d errors=%s",
+        trigger, summary["ok"], len(sources), expired, duplicates_flagged, errors,
+    )
+    return summary
+
+
+_background: set[asyncio.Task] = set()
+
+
+def start_refresh(trigger: str) -> bool:
+    """Starts `refresh_all_sources` in the background (outside the HTTP request). False when one
+    is already running in this process; across processes the advisory lock keeps it to one."""
+    if any(not task.done() for task in _background):
+        return False
+    task = asyncio.create_task(refresh_all_sources(trigger))
+    _background.add(task)
+    task.add_done_callback(_finished)
+    return True
+
+
+def _finished(task: asyncio.Task) -> None:
+    _background.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("Source refresh crashed", exc_info=task.exception())
