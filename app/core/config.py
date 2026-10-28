@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 from typing import List, Optional
 
 from pydantic_settings import BaseSettings
@@ -21,6 +22,9 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_HOURS: int = 720  # 30 days — students open Orbit between lectures
     SESSION_COOKIE: str = "orbit_session"
+    # Parent domain for the session cookie (e.g. ".example.com") so the frontend's
+    # host receives the cookie the API host sets. Blank = host-only (localhost).
+    SESSION_COOKIE_DOMAIN: Optional[str] = None
     FRONTEND_URL: str = "http://localhost:3000"
     BACKEND_URL: str = "http://localhost:8090"
     # Founder/ops account promoted on signup, matching Orbit's super_admin_email().
@@ -39,13 +43,18 @@ class Settings(BaseSettings):
     # Stripe ----------------------------------------------------------------
     STRIPE_SECRET_KEY: Optional[str] = None
     STRIPE_WEBHOOK_SECRET: Optional[str] = None
+    # Signing secret of the Connect webhook endpoint (connected-account events
+    # such as account.updated). Either secret, or a comma-separated list, verifies.
+    STRIPE_CONNECT_WEBHOOK_SECRET: Optional[str] = None
+    # Orbit's cut of each paid ticket, in percent ("5" or "5%"). Anything that
+    # is not a positive number means no fee; values above 100 are capped.
+    PLATFORM_FEE_PERCENT: str = "0"
     CURRENCY: str = "GBP"
 
     # Uploads ---------------------------------------------------------------
     CLOUDINARY_CLOUD_NAME: Optional[str] = None
     CLOUDINARY_API_KEY: Optional[str] = None
     CLOUDINARY_API_SECRET: Optional[str] = None
-    UPLOAD_DIR: str = "./var/uploads"
     IMAGE_MAX_BYTES: dict = {"event-covers": 5 * 1024 * 1024, "organiser-logos": 2 * 1024 * 1024}
 
     # Web push --------------------------------------------------------------
@@ -92,6 +101,22 @@ class Settings(BaseSettings):
     @property
     def stripe_configured(self) -> bool:
         return bool(self.STRIPE_SECRET_KEY)
+
+    @property
+    def stripe_webhook_secrets(self) -> List[str]:
+        raw = [self.STRIPE_WEBHOOK_SECRET or "", self.STRIPE_CONNECT_WEBHOOK_SECRET or ""]
+        return [s.strip() for value in raw for s in value.split(",") if s.strip()]
+
+    @property
+    def platform_fee_percent(self) -> float:
+        raw = (self.PLATFORM_FEE_PERCENT or "").strip().removesuffix("%")
+        try:
+            value = float(raw)
+        except ValueError:
+            return 0.0
+        if not math.isfinite(value) or value <= 0:
+            return 0.0
+        return min(value, 100.0)
 
     @property
     def cloudinary_configured(self) -> bool:

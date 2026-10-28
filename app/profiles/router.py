@@ -1,7 +1,7 @@
 """The signed-in person: profile, onboarding, preferences, their events and tickets."""
 
-from datetime import datetime, timedelta
-from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response
@@ -10,33 +10,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.deps import require_user
+from app.events import service as events_svc
+from app.profiles import service
+from app.profiles.schemas import EventState, MyCalendar, MyEventsPage, ProfileUpdate
 
 router = APIRouter(prefix="/me", tags=["me"])
 
-PROFILE_FIELDS = {
-    "full_name", "avatar_url", "university", "department", "course", "year_of_study",
-    "career_interests", "personal_interests", "preferred_categories", "preferred_formats",
-    "goals", "user_type", "location_preference", "availability", "graduation_year",
-    "company", "industry", "job_title", "host_role",
-}
-
-EVENT_CARD = """
-select e.id, e.title, e.summary, e.cover_url, e.starts_at, e.ends_at, e.timezone,
-       e.format, e.venue_name, e.city, e.country, e.category_id, e.tags, e.status,
-       e.external_url, e.external_label, e.price_min, e.price_max, e.currency,
-       e.registration_mode, e.capacity, e.series_key, e.series_label,
-       o.name as organiser_name, o.slug as organiser_slug, o.logo_url as organiser_logo,
-       (select count(*) from public.registrations r
-         where r.event_id = e.id and r.status = 'going') as going,
-       exists (select 1 from public.user_events ue
-                where ue.event_id = e.id and ue.user_id = :uid and ue.kind = 'saved') as saved
-  from public.events e
-  left join public.organisers o on o.id = e.organiser_id
-"""
-
 
 def _ics(dt: datetime) -> str:
-    return dt.astimezone().strftime("%Y%m%dT%H%M%SZ")
+    return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
 
 
 @router.get("")
@@ -86,44 +74,29 @@ async def me(user: dict = Depends(require_user), db: AsyncSession = Depends(get_
 
 @router.patch("")
 async def update_profile(
-    body: dict[str, Any],
+    body: ProfileUpdate,
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Update the editable profile fields. Role, email and verification are never writable here."""
-    fields = {k: v for k, v in body.items() if k in PROFILE_FIELDS}
+    """Update the editable profile fields that were sent. Unknown keys are a 422.
+
+    `preferred_categories` keeps only slugs that exist.
+    """
+    fields = body.model_dump(exclude_unset=True)
     if not fields:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Nothing to update")
-    sets = ", ".join(f"{k} = :{k}" for k in fields)
-    await db.execute(
-        text(f"update public.profiles set {sets}, updated_at = now() where id = :uid"),
-        {**fields, "uid": user["id"]},
-    )
+    await service.update_profile(db, user["id"], fields)
     return await me(user, db)
 
 
 @router.post("/onboarding")
 async def onboarding(
-    body: dict[str, Any],
+    body: ProfileUpdate,
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Save the onboarding answers and mark the profile onboarded."""
-    fields = {k: v for k, v in body.items() if k in PROFILE_FIELDS}
-    if fields:
-        sets = ", ".join(f"{k} = :{k}" for k in fields)
-        await db.execute(
-            text(
-                f"update public.profiles set {sets}, onboarded_at = now(),"
-                " updated_at = now() where id = :uid"
-            ),
-            {**fields, "uid": user["id"]},
-        )
-    else:
-        await db.execute(
-            text("update public.profiles set onboarded_at = now() where id = :uid"),
-            {"uid": user["id"]},
-        )
+    await service.update_profile(db, user["id"], body.model_dump(exclude_unset=True), onboard=True)
     return await me(user, db)
 
 
@@ -149,75 +122,63 @@ async def preferences(
     return {"ok": True}
 
 
-@router.get("/events")
+@router.get("/event-state", response_model=EventState)
+async def event_state(
+    event_ids: str | None = Query(
+        None, description="Comma-separated event ids, at most 200. Omit for every event."
+    ),
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Which events I saved, dismissed, registered for elsewhere or attended, and my
+    registration status per event."""
+    ids = None if event_ids is None else events_svc.parse_ids(event_ids, name="event_ids")
+    return await service.event_state(db, user["id"], ids)
+
+
+@router.get("/events", response_model=MyEventsPage)
 async def my_events(
-    when: str = Query("upcoming", pattern="^(upcoming|past)$"),
+    when: Literal["upcoming", "past"] = "upcoming",
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Events I saved or registered for, split the way the profile page shows them."""
-    op = ">=" if when == "upcoming" else "<"
-    rows = (
-        await db.execute(
-            text(
-                EVENT_CARD
-                + f"""
-                 where e.starts_at {op} now()
-                   and (exists (select 1 from public.user_events ue
-                                 where ue.event_id = e.id and ue.user_id = :uid
-                                   and ue.kind in ('saved','attended'))
-                        or exists (select 1 from public.registrations r
-                                    where r.event_id = e.id and r.user_id = :uid
-                                      and r.status in ('going','pending','waitlisted','awaiting_payment')))
-                 order by e.starts_at {'asc' if when == 'upcoming' else 'desc'}
-                """
-            ),
-            {"uid": user["id"]},
-        )
-    ).mappings().all()
-    return {"items": [dict(r) for r in rows], "total": len(rows), "when": when}
+    """Events I saved, attended, registered for here or elsewhere.
+
+    `upcoming`: not ended yet, soonest first. `past`: ended, latest first.
+    """
+    items = await service.my_events(db, user["id"], when)
+    return {"items": items, "total": len(items), "when": when}
 
 
-@router.get("/calendar")
+@router.get("/calendar", response_model=MyCalendar)
 async def my_calendar(
-    date_from: str | None = Query(None, alias="from"),
-    date_to: str | None = Query(None, alias="to"),
+    date_from: datetime | None = Query(None, alias="from"),
+    date_to: datetime | None = Query(None, alias="to"),
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Saved events and active registrations in a window (defaults: next 90 days)."""
-    start = date_from or datetime.utcnow().isoformat()
-    end = date_to or (datetime.utcnow() + timedelta(days=90)).isoformat()
-    rows = (
-        await db.execute(
-            text(
-                EVENT_CARD
-                + """
-                 where e.starts_at >= :start and e.starts_at <= :end
-                   and (exists (select 1 from public.user_events ue
-                                 where ue.event_id = e.id and ue.user_id = :uid and ue.kind = 'saved')
-                        or exists (select 1 from public.registrations r
-                                    where r.event_id = e.id and r.user_id = :uid
-                                      and r.status = 'going'))
-                 order by e.starts_at
-                """
-            ),
-            {"uid": user["id"], "start": start, "end": end},
-        )
-    ).mappings().all()
-    return {"items": [dict(r) for r in rows], "total": len(rows)}
+    """Saved, externally registered and registered events overlapping [from, to).
+
+    Defaults: now to 90 days ahead. Cancelled events are included.
+    """
+    start = _aware(date_from) or datetime.now(timezone.utc)
+    end = _aware(date_to) or start + timedelta(days=90)
+    items = await service.my_calendar(db, user["id"], start, end)
+    return {"items": items, "total": len(items)}
 
 
 @router.get("/calendar.ics")
 async def my_calendar_ics(
     user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
 ):
-    """The same window as a downloadable calendar file."""
-    data = await my_calendar(None, None, user, db)
+    """My upcoming calendar (published events only) as a downloadable calendar file."""
+    items = await service.my_calendar(
+        db, user["id"], datetime.now(timezone.utc), None, statuses=("published",)
+    )
     lines = [
         "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Orbit//EN", "CALSCALE:GREGORIAN",
     ]
-    for e in data["items"]:
+    for e in items:
         lines += [
             "BEGIN:VEVENT",
             f"UID:{e['id']}@orbit",

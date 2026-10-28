@@ -3,6 +3,7 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Query, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -44,7 +45,7 @@ async def checkout_success(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Confirm a returned checkout and mark a paid registration as going."""
+    """What happened to a returned checkout; a paid registration becomes going now."""
     return await service.checkout_success(db, session_id, user)
 
 
@@ -54,7 +55,7 @@ async def connect_status(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Whether the organiser has a Stripe account and can take charges."""
+    """The organiser's payout state, read live from Stripe and synced."""
     await org_role(db, organiser_id, user, owner=True)
     return await service.connect_status(db, organiser_id)
 
@@ -67,18 +68,19 @@ async def connect_onboarding(
 ) -> dict:
     """Create an Express account if needed and return a fresh onboarding link."""
     await org_role(db, body.organiser_id, user, owner=True)
-    return await service.connect_onboarding(db, body.organiser_id)
+    return await service.connect_onboarding(db, body.organiser_id, user)
 
 
-@payments_router.get("/connect/refresh")
+@payments_router.get("/connect/refresh", status_code=303, response_class=RedirectResponse)
 async def connect_refresh(
     organiser_id: UUID = Query(),
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
-) -> dict:
-    """A new onboarding link for an account that has not finished setup."""
+) -> RedirectResponse:
+    """303 to a fresh onboarding link, or back to the payments page."""
     await org_role(db, organiser_id, user, owner=True)
-    return await service.connect_refresh(db, organiser_id)
+    location = await service.connect_refresh_location(db, organiser_id)
+    return RedirectResponse(location, status_code=303)
 
 
 @payments_router.post("/connect/dashboard")
@@ -97,10 +99,14 @@ async def stripe_webhook(
     request: Request,
     stripe_signature: str = Header(default="", alias="Stripe-Signature"),
     db: AsyncSession = Depends(get_db),
-) -> dict:
+):
     """Stripe's webhook; signature-verified and idempotent per event id."""
-    payload = await request.body()
-    return await service.handle_webhook(db, payload, stripe_signature)
+    payload = await request.body()  # verification needs the exact raw body
+    try:
+        return await service.handle_webhook(db, payload, stripe_signature)
+    except service.WebhookFailed:
+        # The claim was released in this transaction; a 5xx makes Stripe retry.
+        return JSONResponse({"detail": "processing_failed"}, status_code=500)
 
 
 router.include_router(payments_router)
