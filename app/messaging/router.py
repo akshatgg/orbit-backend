@@ -38,8 +38,8 @@ async def list_conversations(
 
     Pages by keyset: pass `next_cursor` back as `cursor`.
     """
-    page = await ms.conversations(db, user["id"], limit=limit, cursor=cursor)
-    page["unread_total"] = await ms.unread_total(db, user["id"])
+    page = await ms.conversations(db, str(user["id"]), limit=limit, cursor=cursor)
+    page["unread_total"] = await ms.unread_total(db, str(user["id"]))
     return page
 
 
@@ -49,7 +49,7 @@ async def unread_count(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Unread messages across all my conversations (the nav badge)."""
-    return {"unread_total": await ms.unread_total(db, user["id"])}
+    return {"unread_total": await ms.unread_total(db, str(user["id"]))}
 
 
 @router.post("/direct")
@@ -63,16 +63,16 @@ async def start_direct(
     403 when we share no group, or either of us blocked the other.
     """
     other = gs.as_uuid(body.user_id, "user id")
-    if other == user["id"]:
+    if other == str(user["id"]):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "That's you")
     exists = (
         await db.execute(text("select 1 from public.users where id = :id"), {"id": other})
     ).first()
     if not exists:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
-    if await ms.blocked_either_way(db, user["id"], other):
+    if await ms.blocked_either_way(db, str(user["id"]), other):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You can't message this person")
-    if not await ms.share_a_group(db, user["id"], other):
+    if not await ms.share_a_group(db, str(user["id"]), other):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "You can only message people you share a circle or community with",
@@ -88,7 +88,7 @@ async def start_direct(
                 returning id
                 """
             ),
-            {"a": user["id"], "b": other},
+            {"a": str(user["id"]), "b": other},
         )
     ).scalar_one()
     return {"id": str(conversation_id)}
@@ -116,7 +116,7 @@ async def circle_conversation(
                 returning id
                 """
             ),
-            {"g": g["id"], "u": user["id"]},
+            {"g": g["id"], "u": str(user["id"])},
         )
     ).scalar_one()
     return {"id": str(conversation_id)}
@@ -139,11 +139,11 @@ async def get_thread(
     otherwise it is the full list item plus `members`. `has_more` says whether more
     messages lie beyond the page (older ones, or with `after` newer ones).
     """
-    c = await ms.open_conversation(db, conversation_id, user["id"])
+    c = await ms.open_conversation(db, conversation_id, str(user["id"]))
     items, more = await ms.thread(
         db,
         str(conversation_id),
-        user["id"],
+        str(user["id"]),
         after=after,
         after_id=str(after_id) if after_id else None,
         before=before,
@@ -154,7 +154,7 @@ async def get_thread(
         conversation = ms.slim(c)
     else:
         listed = await ms.conversations(
-            db, user["id"], limit=1, cursor=None, only=str(conversation_id)
+            db, str(user["id"]), limit=1, cursor=None, only=str(conversation_id)
         )
         conversation = listed["items"][0] if listed["items"] else ms.slim(c)
         conversation["members"] = await ms.members(db, c, user)
@@ -169,7 +169,7 @@ async def send_message(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Send a message (1-2000 characters, at most 20 a minute)."""
-    c = await ms.open_conversation(db, conversation_id, user["id"])
+    c = await ms.open_conversation(db, conversation_id, str(user["id"]))
     return await ms.send(db, c, user, body.body)
 
 
@@ -180,9 +180,9 @@ async def read_conversation(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Mark the conversation read up to now; returns the new badge total."""
-    await ms.open_conversation(db, conversation_id, user["id"])
-    await ms.mark_read(db, str(conversation_id), user["id"])
-    return {"ok": True, "unread_total": await ms.unread_total(db, user["id"])}
+    await ms.open_conversation(db, conversation_id, str(user["id"]))
+    await ms.mark_read(db, str(conversation_id), str(user["id"]))
+    return {"ok": True, "unread_total": await ms.unread_total(db, str(user["id"]))}
 
 
 @router.delete("/{message_id}", status_code=204)
@@ -200,7 +200,7 @@ async def delete_message(
     ).mappings().first()
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Message not found")
-    if str(row["sender_id"]) != user["id"]:
+    if str(row["sender_id"]) != str(user["id"]):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only delete your own messages")
     if row["deleted_at"] is None:
         await db.execute(
@@ -230,7 +230,7 @@ async def list_blocks(
                  order by b.created_at desc
                 """
             ),
-            {"me": user["id"]},
+            {"me": str(user["id"])},
         )
     ).mappings().all()
     return {"items": [{"user": user_brief(r, "u_"), "created_at": r["created_at"]} for r in rows]}
@@ -244,7 +244,7 @@ async def block_user(
 ) -> dict:
     """Block someone: no direct messages either way, and their circle-chat messages are hidden from me."""
     other = gs.as_uuid(body.user_id, "user id")
-    if other == user["id"]:
+    if other == str(user["id"]):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "You can't block yourself")
     row = (
         await db.execute(
@@ -265,7 +265,7 @@ async def block_user(
                  where u.id = :o
                 """
             ),
-            {"me": user["id"], "o": other},
+            {"me": str(user["id"]), "o": other},
         )
     ).mappings().first()
     if not row:
@@ -282,6 +282,6 @@ async def unblock_user(
     """Unblock someone."""
     await db.execute(
         text("delete from public.user_blocks where blocker_id = :me and blocked_id = :o"),
-        {"me": user["id"], "o": str(user_id)},
+        {"me": str(user["id"]), "o": str(user_id)},
     )
     return Response(status_code=204)

@@ -286,7 +286,7 @@ async def members(db: AsyncSession, c: dict[str, Any], me: dict) -> list[dict[st
         ).mappings().all()
         return [user_brief(r, "u_") for r in rows]
     myself = {
-        "id": me["id"],
+        "id": str(me["id"]),
         "full_name": me.get("full_name"),
         "avatar_url": me.get("avatar_url"),
         "university": me.get("university"),
@@ -370,7 +370,7 @@ async def mark_read(db: AsyncSession, conversation_id: str, me: str) -> None:
 
 async def send(db: AsyncSession, c: dict[str, Any], me: dict, body: str) -> dict[str, Any]:
     """Store a message (rate-limited), mark it read for me, and push a DM if it's due."""
-    uid = me["id"]
+    uid = str(me["id"])
     other = str(c["o_id"]) if c["kind"] == "direct" and c["o_id"] else None
     if other and not await share_a_group(db, uid, other):
         raise HTTPException(

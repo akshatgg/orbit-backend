@@ -128,7 +128,7 @@ async def create_group(
                 "university": (body.university or "").strip() or None,
                 "cover_url": body.cover_url,
                 "allow_member_shares": True if body.allow_member_shares is None else body.allow_member_shares,
-                "uid": user["id"],
+                "uid": str(user["id"]),
             },
         )
     ).scalar_one()
@@ -136,7 +136,7 @@ async def create_group(
         text(
             "insert into public.group_members (group_id, user_id, role) values (:g, :u, 'admin')"
         ),
-        {"g": group_id, "u": user["id"]},
+        {"g": group_id, "u": str(user["id"])},
     )
     if body.kind == "circle":
         await db.execute(
@@ -144,7 +144,7 @@ async def create_group(
                 "insert into public.conversations (kind, group_id, created_by)"
                 " values ('circle', :g, :u) on conflict (group_id) do nothing"
             ),
-            {"g": group_id, "u": user["id"]},
+            {"g": group_id, "u": str(user["id"])},
         )
     return await get_group(str(group_id), user, db)
 
@@ -172,7 +172,7 @@ async def my_invites(
                  limit 100
                 """
             ),
-            {"u": user["id"]},
+            {"u": str(user["id"])},
         )
     ).mappings().all()
     return {
@@ -221,7 +221,7 @@ async def shareable_groups(
                  order by (g.kind = 'circle') desc, lower(g.name), g.id
                 """
             ),
-            {"u": user["id"], "e": eid, "orbit_admin": gs.is_orbit_admin(user)},
+            {"u": str(user["id"]), "e": eid, "orbit_admin": gs.is_orbit_admin(user)},
         )
     ).mappings().all()
     return {
@@ -267,7 +267,7 @@ async def preview_invite(
                    and i.status = 'pending' and i.expires_at > now()
                 """
             ),
-            {"c": code, "uid": user["id"] if user else None},
+            {"c": code, "uid": str(user["id"]) if user else None},
         )
     ).mappings().first()
     if not row:
@@ -311,7 +311,7 @@ async def accept_invite_link(
     if not invite:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "That invite has expired")
     group_id = str(invite["group_id"])
-    await _make_member(db, group_id, user["id"])
+    await _make_member(db, group_id, str(user["id"]))
     return {"group_id": group_id, "kind": invite["kind"], "slug": invite["slug"], "status": "joined"}
 
 
@@ -356,7 +356,7 @@ async def get_group(
                     " and invited_user_id = :u and kind = 'invite'"
                     " and status = 'pending' and expires_at > now()"
                 ),
-                {"g": g["id"], "u": user["id"]},
+                {"g": g["id"], "u": str(user["id"])},
             )
         ).scalar_one_or_none()
     listed = g["kind"] == "community" and g["visibility"] in ("public", "approval")
@@ -463,21 +463,21 @@ async def join_group(
                 "select 1 from public.group_invites where group_id = :g and invited_user_id = :u"
                 " and kind = 'invite' and status = 'pending' and expires_at > now()"
             ),
-            {"g": g["id"], "u": user["id"]},
+            {"g": g["id"], "u": str(user["id"])},
         )
     ).first()
     if invited:
-        await _make_member(db, g["id"], user["id"])
+        await _make_member(db, g["id"], str(user["id"]))
         return {"status": "joined"}
     if g["kind"] == "circle":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Circles are joined by invitation")
     if g["visibility"] == "public":
-        await _make_member(db, g["id"], user["id"])
+        await _make_member(db, g["id"], str(user["id"]))
         return {"status": "joined"}
     if g["visibility"] != "approval":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "This community is invite-only")
 
-    await _expire_stale(db, g["id"], user["id"])
+    await _expire_stale(db, g["id"], str(user["id"]))
     request_id = (
         await db.execute(
             text(
@@ -491,7 +491,7 @@ async def join_group(
                 returning id
                 """
             ),
-            {"g": g["id"], "u": user["id"]},
+            {"g": g["id"], "u": str(user["id"])},
         )
     ).scalar_one_or_none()
     if request_id:
@@ -503,7 +503,7 @@ async def join_group(
             admins_only=True,
             body="Approve or decline their request.",
             link=gs.group_path(g),
-            actor_id=user["id"],
+            actor_id=str(user["id"]),
             invite_id=request_id,
         )
     return {"status": "requested"}
@@ -539,7 +539,7 @@ async def leave_group(
                 text(
                     "select count(*) from public.group_members where group_id = :g and user_id <> :u"
                 ),
-                {"g": g["id"], "u": user["id"]},
+                {"g": g["id"], "u": str(user["id"])},
             )
         ).scalar() or 0
         if others == 0 and g["kind"] == "circle":
@@ -551,9 +551,9 @@ async def leave_group(
             )
     await db.execute(
         text("delete from public.group_members where group_id = :g and user_id = :u"),
-        {"g": g["id"], "u": user["id"]},
+        {"g": g["id"], "u": str(user["id"])},
     )
-    await gs.drop_membership_traces(db, g["id"], user["id"])
+    await gs.drop_membership_traces(db, g["id"], str(user["id"]))
     return Response(status_code=204)
 
 
@@ -658,7 +658,7 @@ async def create_invite(
                 "select count(*) from public.group_invites where invited_by = :u"
                 " and kind = 'invite' and created_at > now() - interval '1 hour'"
             ),
-            {"u": user["id"]},
+            {"u": str(user["id"])},
         )
     ).scalar() or 0
     if recent >= INVITES_PER_HOUR:
@@ -685,7 +685,7 @@ async def create_invite(
     if not target:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No Orbit account with that email yet")
     target = str(target)
-    if target == user["id"]:
+    if target == str(user["id"]):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "You're already in this group")
     if await gs.role_of(db, g["id"], {"id": target}):
         raise HTTPException(status.HTTP_409_CONFLICT, "They're already a member")
@@ -703,7 +703,7 @@ async def create_invite(
                 returning id, status, created_at, expires_at
                 """
             ),
-            {"g": g["id"], "t": target, "by": user["id"]},
+            {"g": g["id"], "t": target, "by": str(user["id"])},
         )
     ).mappings().first()
     if not row:
@@ -732,7 +732,7 @@ async def create_invite(
         message.title,
         body=message.body,
         link=path,
-        actor_id=user["id"],
+        actor_id=str(user["id"]),
         group_id=g["id"],
         invite_id=row["id"],
         deliver=message,
@@ -753,7 +753,7 @@ async def create_invite(
         "group_id": g["id"],
         "user": user_brief(invitee, "u_"),
         "invited_by": {
-            "id": user["id"],
+            "id": str(user["id"]),
             "full_name": user.get("full_name"),
             "avatar_url": user.get("avatar_url"),
             "university": user.get("university"),
@@ -838,7 +838,7 @@ async def respond_invite(
         raise HTTPException(status.HTTP_410_GONE, "This invite has expired")
 
     subject = str(invite["invited_user_id"])
-    is_subject = subject == user["id"]
+    is_subject = subject == str(user["id"])
     if invite["kind"] == "invite":
         if not is_subject:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the person invited can answer")
@@ -880,7 +880,7 @@ async def respond_invite(
                 f"You're in {g['name']}",
                 body="Your request to join was approved.",
                 link=gs.group_path(g),
-                actor_id=user["id"],
+                actor_id=str(user["id"]),
                 group_id=g["id"],
             )
     return {"status": new_status, "group_id": g["id"]}
@@ -917,7 +917,7 @@ async def invite_link(
                     returning code, expires_at
                     """
                 ),
-                {"g": g["id"], "by": user["id"]},
+                {"g": g["id"], "by": str(user["id"])},
             )
         ).mappings().first()
     return {
@@ -997,7 +997,7 @@ async def share_event(
                 "insert into public.group_events (group_id, event_id, shared_by, note)"
                 " values (:g, :e, :u, :n) on conflict do nothing returning event_id"
             ),
-            {"g": g["id"], "e": event_id, "u": user["id"], "n": body.note},
+            {"g": g["id"], "e": event_id, "u": str(user["id"]), "n": body.note},
         )
     ).first()
     if inserted and g["kind"] == "circle":
@@ -1008,7 +1008,7 @@ async def share_event(
             f"{_display_name(user)} shared an event in {g['name']}",
             body=event["title"],
             link=gs.group_path(g),
-            actor_id=user["id"],
+            actor_id=str(user["id"]),
         )
     return {
         "group_id": g["id"],
@@ -1038,7 +1038,7 @@ async def unshare_event(
     ).first()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not shared with this group")
-    if str(row[0]) != user["id"] and not gs.can_manage(g, await gs.role_of(db, g["id"], user), user):
+    if str(row[0]) != str(user["id"]) and not gs.can_manage(g, await gs.role_of(db, g["id"], user), user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only whoever shared it, or an admin")
     await db.execute(
         text("delete from public.group_events where group_id = :g and event_id = :e"),
@@ -1080,7 +1080,7 @@ async def set_interest(
             on conflict (group_id, event_id, user_id) do update set status = excluded.status
             """
         ),
-        {"g": g["id"], "e": eid, "u": user["id"], "s": body.status},
+        {"g": g["id"], "e": eid, "u": str(user["id"]), "s": body.status},
     )
     return {"status": body.status}
 
@@ -1099,7 +1099,7 @@ async def clear_interest(
             "delete from public.group_event_interests"
             " where group_id = :g and event_id = :e and user_id = :u"
         ),
-        {"g": g["id"], "e": str(event_id), "u": user["id"]},
+        {"g": g["id"], "e": str(event_id), "u": str(user["id"])},
     )
     return Response(status_code=204)
 
@@ -1208,7 +1208,7 @@ async def create_announcement(
                   left join public.events e on e.id = a.event_id
                 """
             ),
-            {"g": g["id"], "a": user["id"], "b": body.body.strip(), "e": event_id},
+            {"g": g["id"], "a": str(user["id"]), "b": body.body.strip(), "e": event_id},
         )
     ).mappings().first()
     await inbox.notify_group(
@@ -1218,6 +1218,6 @@ async def create_announcement(
         f"New in {g['name']}",
         body=body.body.strip()[:200],
         link=gs.group_path(g),
-        actor_id=user["id"],
+        actor_id=str(user["id"]),
     )
     return _announcement(row)

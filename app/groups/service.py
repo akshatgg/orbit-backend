@@ -158,7 +158,7 @@ async def role_of(db: AsyncSession, group_id: str, user: Optional[dict]) -> Opti
     return (
         await db.execute(
             text("select role from public.group_members where group_id = :g and user_id = :u"),
-            {"g": group_id, "u": user["id"]},
+            {"g": group_id, "u": str(user["id"])},
         )
     ).scalar_one_or_none()
 
@@ -178,7 +178,7 @@ async def card(db: AsyncSession, group_id: str, user: Optional[dict]) -> dict[st
                 """
                 + CARD_SELECT
             ),
-            {"id": group_id, "uid": user["id"] if user else None},
+            {"id": group_id, "uid": str(user["id"]) if user else None},
         )
     ).mappings().first()
     if not row:
@@ -199,7 +199,7 @@ async def directory(
     cursor: Optional[str],
 ) -> dict[str, Any]:
     """Groups I'm in first, then by name. Keyset on (not joined, lower(name), id)."""
-    uid = user["id"] if user else None
+    uid = str(user["id"]) if user else None
     where = ["true"]
     params: dict[str, Any] = {"uid": uid}
 
@@ -536,7 +536,7 @@ async def feed(
         found = (await db.execute(card_query().where(Event.id.in_(ids)))).all()
         for item in await with_counts(db, [event_card(*row) for row in found]):
             cards[str(item["id"])] = item
-    people = await _interest(db, g["id"], ids, user["id"] if user else None) if ids else {}
+    people = await _interest(db, g["id"], ids, str(user["id"]) if user else None) if ids else {}
 
     items = []
     for r in rows:
