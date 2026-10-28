@@ -25,7 +25,7 @@ from app.groups.schemas import (
     InviteRespond,
     ShareEvent,
 )
-from app.models import Group, GroupAnnouncement, GroupEvent, GroupEventInterest, GroupInvite, GroupMember
+from app.models import GroupEvent, GroupEventInterest, GroupInvite, GroupMember
 
 router = APIRouter(prefix="/groups", tags=["groups"])
 
