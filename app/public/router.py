@@ -6,9 +6,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.routing import NumbersRoute
 from app.public import service
 
-router = APIRouter(prefix="/public", tags=["public"])
+router = APIRouter(prefix="/public", tags=["public"], route_class=NumbersRoute)
 
 
 @router.get("/landing-events")

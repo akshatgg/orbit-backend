@@ -32,6 +32,7 @@ from app.categories.models import Category
 from app.core.database import get_db
 from app.core.deps import require_admin, require_super_admin
 from app.core.pagination import pagination
+from app.core.routing import NumbersRoute
 from app.events.models import Event
 from app.notifications.service import (
     LOGISTICS,
@@ -46,7 +47,7 @@ from app.tickets.models import Registration
 from app.uploads.release import release_images
 from app.users.models import Profile, User
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+router = APIRouter(prefix="/admin", tags=["admin"], route_class=NumbersRoute)
 
 EVENT_STATUSES = ("draft", "published", "cancelled", "expired", "removed")
 ORGANISER_STATUSES = ("pending", "approved", "rejected", "suspended")

@@ -14,13 +14,14 @@ from app.core.deps import (
     require_user,
 )
 from app.core.pagination import pagination
+from app.core.routing import NumbersRoute
 
 from . import service
 from .schemas import MemberAdd, OrganiserCreate, OrganiserUpdate
 
-router = APIRouter(tags=["organisers"])
-organisers_router = APIRouter(prefix="/organisers", tags=["organisers"])
-invites_router = APIRouter(prefix="/invites", tags=["organisers"])
+router = APIRouter(tags=["organisers"], route_class=NumbersRoute)
+organisers_router = APIRouter(prefix="/organisers", tags=["organisers"], route_class=NumbersRoute)
+invites_router = APIRouter(prefix="/invites", tags=["organisers"], route_class=NumbersRoute)
 
 
 @organisers_router.get("")

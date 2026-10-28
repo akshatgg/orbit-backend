@@ -15,6 +15,7 @@ from app.categories.models import Category
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import require_admin
+from app.core.routing import NumbersRoute
 from app.events.models import Event
 from app.organisers.models import Organiser
 from app.sources.models import EventDuplicateDismissal, EventSource, SourceEventDetails, SourceRun
@@ -37,7 +38,7 @@ from app.sources.service import (
 )
 from app.uploads.release import release_images
 
-router = APIRouter(prefix="/admin/sources", tags=["admin:sources"])
+router = APIRouter(prefix="/admin/sources", tags=["admin:sources"], route_class=NumbersRoute)
 
 SOURCE_LABELS = {"orbit": "ORBIT (organiser)", "manual": "Added by an admin", "csv": "CSV import"}
 IMPORTED_KINDS = {"luma", "luma-discover", "meetup", "meetup-search", "eventbrite", "fatsoma"}

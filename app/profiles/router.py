@@ -11,11 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.deps import require_user
+from app.core.routing import NumbersRoute
 from app.events import service as events_svc
 from app.profiles import service
 from app.profiles.schemas import EventState, MyCalendar, MyEventsPage, ProfileUpdate
 
-router = APIRouter(prefix="/me", tags=["me"])
+router = APIRouter(prefix="/me", tags=["me"], route_class=NumbersRoute)
 
 
 def _ics(dt: datetime) -> str:

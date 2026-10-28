@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.deps import require_event_manager, require_user
 from app.core.pagination import pagination
+from app.core.routing import NumbersRoute
 from app.organisers.service import org_role
 
 from . import service
@@ -22,7 +23,7 @@ from .schemas import (
     GuestStatus,
 )
 
-router = APIRouter(prefix="/organiser", tags=["studio"])
+router = APIRouter(prefix="/organiser", tags=["studio"], route_class=NumbersRoute)
 
 
 @router.get("/overview")
