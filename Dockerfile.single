@@ -1,0 +1,42 @@
+# Single-container build: Postgres 17 + the FastAPI app in one image.
+#
+#   docker build -f Dockerfile.single -t mark-orbit .
+#
+# The database lives in /var/lib/postgresql/data, which MUST be a mounted
+# volume — a container without it loses every row on the next deploy.
+# scripts/entrypoint-single.sh starts Postgres, migrates, seeds once, then
+# runs uvicorn.
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PGDATA=/var/lib/postgresql/data \
+    PATH=/usr/lib/postgresql/17/bin:$PATH
+
+# Postgres 17 from the official PGDG repository (Debian's own is 15).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release libpq5 \
+ && install -d /usr/share/postgresql-common/pgdg \
+ && curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+      https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+ && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+      https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+      > /etc/apt/sources.list.d/pgdg.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends postgresql-17 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --upgrade pip && pip install -r requirements.txt
+
+COPY . .
+
+RUN chmod +x scripts/entrypoint-single.sh \
+ && mkdir -p /var/lib/postgresql/data /var/run/postgresql \
+ && chown -R postgres:postgres /var/lib/postgresql /var/run/postgresql
+
+EXPOSE 8090
+CMD ["./scripts/entrypoint-single.sh"]

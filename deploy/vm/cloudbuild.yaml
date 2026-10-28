@@ -1,0 +1,18 @@
+# Builds the single-container image (Postgres 17 + API) on amd64.
+#   gcloud builds submit --project markai-499512 \
+#     --config deploy/vm/cloudbuild.yaml --substitutions _TAG=$(git rev-parse --short HEAD) .
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - Dockerfile.single
+      - -t
+      - us-central1-docker.pkg.dev/markai-499512/markai/markai-orbit:$_TAG
+      - .
+images:
+  - us-central1-docker.pkg.dev/markai-499512/markai/markai-orbit:$_TAG
+substitutions:
+  _TAG: manual
+options:
+  logging: CLOUD_LOGGING_ONLY
