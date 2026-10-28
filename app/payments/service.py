@@ -231,6 +231,29 @@ async def start_checkout(db: AsyncSession, registration_id: UUID, user: dict) ->
     return {"checkout_url": session["url"]}
 
 
+async def create_checkout_for_registration(db: AsyncSession, registration: dict) -> Optional[str]:
+    """Checkout URL for a registration that just became awaiting_payment, or None.
+
+    `POST /events/{id}/registrations` looks this up (app/events/service.py
+    `checkout_url`) so registering for a paid ticket returns `checkout_url`, as
+    the frontend's register action redirected straight to Stripe. When it is
+    None the caller can ask `POST /payments/registrations/{id}/checkout` for the
+    reason code.
+    """
+    buyer = await _one(
+        db, "select id, email from profiles where id = :id", {"id": registration["user_id"]}
+    )
+    if not buyer or gateway.get_gateway() is None:
+        return None
+    try:
+        async with db.begin_nested():
+            result = await start_checkout(db, registration["id"], buyer)
+    except HTTPException as exc:
+        logger.info("[payments] no checkout for registration %s: %s", registration["id"], exc.detail)
+        return None
+    return result["checkout_url"]
+
+
 # ─── fulfilment (webhook and success page) ──────────────────────────────────
 
 
