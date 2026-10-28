@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status as http_sta
 from sqlalchemy import and_, delete, func, insert, or_, select, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.admin.models import AdminAuditLog
 from app.admin.schemas import (
@@ -878,11 +879,28 @@ async def admin_organisers(
         .scalar_subquery()
     )
 
+    applicant = aliased(Profile)
+    reviewer = aliased(Profile)
+
     filters = []
     if tab in ORGANISER_STATUSES:
         filters.append(Organiser.status == tab)
     if q and q.strip():
-        filters.append(Organiser.name.ilike(f"%{_escape_like(q)}%", escape="\\"))
+        # The frontend's organiser search: name, slug, contact email or university.
+        pattern = f"%{_escape_like(q)}%"
+        filters.append(
+            or_(
+                *(
+                    column.ilike(pattern, escape="\\")
+                    for column in (
+                        Organiser.name,
+                        Organiser.slug,
+                        Organiser.contact_email,
+                        Organiser.university,
+                    )
+                )
+            )
+        )
 
     order = Organiser.created_at.asc() if tab == "pending" else Organiser.created_at.desc()
     rows = (
@@ -892,13 +910,28 @@ async def admin_organisers(
                 event_count.label("event_count"),
                 member_count.label("member_count"),
                 owner_names.label("owner_names"),
+                applicant.full_name,
+                applicant.email,
+                reviewer.full_name,
+                reviewer.email,
             )
+            .outerjoin(applicant, applicant.id == Organiser.created_by)
+            .outerjoin(reviewer, reviewer.id == Organiser.reviewed_by)
             .where(*filters)
             .order_by(order)
         )
     ).all()
     items = []
-    for organiser, events, members, owners in rows:
+    for (
+        organiser,
+        events,
+        members,
+        owners,
+        applicant_name,
+        applicant_email,
+        reviewer_name,
+        reviewer_email,
+    ) in rows:
         items.append(
             {
                 "id": organiser.id,
@@ -914,7 +947,14 @@ async def admin_organisers(
                 "is_verified": organiser.is_verified,
                 "review_note": organiser.review_note,
                 "reviewed_by": organiser.reviewed_by,
+                # Who reviewed it, by name (their email when they have none), as the page shows.
+                "reviewed_by_name": reviewer_name or reviewer_email,
                 "reviewed_at": organiser.reviewed_at,
+                "stripe_charges_enabled": organiser.stripe_charges_enabled,
+                # The applicant: the account that created the organiser.
+                "created_by": organiser.created_by,
+                "created_by_name": applicant_name,
+                "created_by_email": applicant_email,
                 "created_at": organiser.created_at,
                 "event_count": int(events or 0),
                 "member_count": int(members or 0),
