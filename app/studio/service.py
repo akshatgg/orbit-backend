@@ -10,8 +10,10 @@ import io
 import json
 import re
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Optional
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import HTTPException, status
 from sqlalchemy import text
@@ -141,11 +143,104 @@ async def overview(db: AsyncSession, organiser_id: UUID | str) -> dict:
     }
 
 
+# ─── studio event list ──────────────────────────────────────────────────────
+
+
+async def list_events(
+    db: AsyncSession, organiser_id: UUID | str, page: int, page_size: int
+) -> dict:
+    """Every event of one organiser, any status, newest start first, with counts."""
+    total = int(
+        await _val(
+            db, "select count(*) from events where organiser_id = :o", {"o": organiser_id}
+        )
+        or 0
+    )
+    items = await _all(
+        db,
+        f"select {EVENT_COLUMNS} from events where organiser_id = :o"
+        " order by starts_at desc, created_at desc limit :lim offset :off",
+        {"o": organiser_id, "lim": page_size, "off": offset(page, page_size)},
+    )
+    return {
+        "items": await with_counts(db, items),
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+# ─── guards ─────────────────────────────────────────────────────────────────
+
+# Registrations that hold a place (the frontend's ACTIVE_REGISTRATION).
+ACTIVE_REGISTRATION = ["going", "pending", "waitlisted", "awaiting_payment"]
+
+
+async def _organiser(db: AsyncSession, organiser_id: UUID | str) -> dict:
+    org = await _one(
+        db,
+        "select id, name, slug, status, stripe_charges_enabled from organisers where id = :o",
+        {"o": organiser_id},
+    )
+    if not org:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Organiser not found")
+    return org
+
+
+def _require_approved(org: dict) -> None:
+    """Only approved organisers create, edit or publish events."""
+    if org["status"] != "approved":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "organiser_not_approved")
+
+
+def _require_charges(org: dict, prices: list[Any]) -> None:
+    """A live event can only sell paid tickets once Stripe payouts are connected."""
+    paid = any(Decimal(str(price or 0)) > 0 for price in prices)
+    if paid and not org["stripe_charges_enabled"]:
+        raise HTTPException(status.HTTP_409_CONFLICT, "stripe_not_ready")
+
+
+def _require_editable(event: dict) -> None:
+    if event["status"] in ("cancelled", "removed"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "event_not_editable")
+
+
+async def _has_active_registrations(
+    db: AsyncSession, event_id: UUID | str, ticket_type_ids: list[str] | None = None
+) -> bool:
+    where = " and ticket_type_id = any(:tt)" if ticket_type_ids is not None else ""
+    params: dict[str, Any] = {"e": event_id, "active": ACTIVE_REGISTRATION}
+    if ticket_type_ids is not None:
+        params["tt"] = [UUID(str(i)) for i in ticket_type_ids]
+    return bool(
+        await _val(
+            db,
+            "select exists(select 1 from registrations"
+            f" where event_id = :e and status = any(:active){where})",
+            params,
+        )
+    )
+
+
+async def _ticket_prices(db: AsyncSession, event_id: UUID | str) -> list[Any]:
+    return [
+        row["price"]
+        for row in await _all(
+            db, "select price from ticket_types where event_id = :e", {"e": event_id}
+        )
+    ]
+
+
 # ─── editor ─────────────────────────────────────────────────────────────────
 
 
 async def event_detail(db: AsyncSession, event_id: UUID | str) -> dict:
     event = await _event(db, event_id)
+    organiser = await _one(
+        db,
+        "select id, name, slug from organisers where id = :o",
+        {"o": event["organiser_id"]},
+    )
     private = await _one(
         db,
         "select online_url, guest_info, updated_at from event_private where event_id = :e",
@@ -177,6 +272,7 @@ async def event_detail(db: AsyncSession, event_id: UUID | str) -> dict:
         )
     return {
         "event": event,
+        "organiser": organiser,
         "private": private,
         "ticket_types": tickets,
         "questions": questions,
@@ -188,53 +284,102 @@ async def event_detail(db: AsyncSession, event_id: UUID | str) -> dict:
     }
 
 
-async def _insert_tickets(
-    db: AsyncSession, event_id: UUID, tickets: list[dict], currency: str
-) -> None:
-    for index, ticket in enumerate(tickets):
-        await db.execute(
-            text(
-                """
-                insert into ticket_types
-                  (event_id, name, description, price, currency, quantity, sales_end_at, sort_order)
-                values
-                  (:event_id, :name, :description, :price, :currency, :quantity, :sales_end_at,
-                   :sort_order)
-                """
-            ),
-            {
-                "event_id": event_id,
-                "name": ticket["name"],
-                "description": ticket.get("description"),
-                "price": ticket["price"],
-                "currency": ticket.get("currency") or currency,
-                "quantity": ticket.get("quantity"),
-                "sales_end_at": ticket.get("sales_end_at"),
-                "sort_order": ticket.get("sort_order") or index,
-            },
-        )
+# Ticket types and questions are synced row by row (the frontend's syncChildren):
+# a row with an id that belongs to the event is updated in place, a row without
+# one is inserted, and a current row that is not submitted is deleted. Ticket
+# rows that are kept keep their id, so registrations keep their ticket_type_id
+# (the foreign key is `on delete set null`).
+
+CHILD_TABLES = ("ticket_types", "event_questions")
 
 
-async def _insert_questions(
-    db: AsyncSession, event_id: UUID, questions: list[dict]
-) -> None:
-    for index, question in enumerate(questions):
-        await db.execute(
-            text(
-                """
-                insert into event_questions (event_id, label, kind, options, required, sort_order)
-                values (:event_id, :label, :kind, :options, :required, :sort_order)
-                """
-            ),
-            {
-                "event_id": event_id,
-                "label": question["label"],
-                "kind": question["kind"],
-                "options": question.get("options") or [],
-                "required": question["required"],
-                "sort_order": question.get("sort_order") or index,
-            },
+def _child_values(table: str, row: dict, index: int, currency: str) -> dict:
+    sort_order = row.get("sort_order") or index
+    if table == "ticket_types":
+        return {
+            "name": row["name"],
+            "description": row.get("description"),
+            "price": row["price"],
+            "currency": row.get("currency") or currency,
+            "quantity": row.get("quantity"),
+            "sales_end_at": row.get("sales_end_at"),
+            "sort_order": sort_order,
+        }
+    return {
+        "label": row["label"],
+        "kind": row["kind"],
+        "options": row.get("options") or [],
+        "required": row["required"],
+        "sort_order": sort_order,
+    }
+
+
+async def _child_plan(
+    db: AsyncSession, table: str, event_id: UUID | str, rows: list[dict]
+) -> tuple[set[str], list[str]]:
+    """Which current rows are kept (submitted with their id) and which are removed."""
+    assert table in CHILD_TABLES
+    current = {
+        str(row["id"])
+        for row in await _all(
+            db, f"select id from {table} where event_id = :e", {"e": event_id}
         )
+    }
+    keep = {str(row["id"]) for row in rows if row.get("id") and str(row["id"]) in current}
+    remove = sorted(current - keep)
+    return keep, remove
+
+
+async def _sync_children(
+    db: AsyncSession,
+    table: str,
+    event_id: UUID | str,
+    rows: list[dict],
+    currency: str,
+    keep: set[str],
+    remove: list[str],
+) -> list[str]:
+    """Apply a plan from _child_plan; returns the row ids in submitted order."""
+    assert table in CHILD_TABLES
+    if remove:
+        await db.execute(
+            text(f"delete from {table} where event_id = :e and id = any(:ids)"),
+            {"e": event_id, "ids": [UUID(i) for i in remove]},
+        )
+    ids: list[str] = []
+    for index, row in enumerate(rows):
+        values = _child_values(table, row, index, currency)
+        row_id = str(row["id"]) if row.get("id") else None
+        if row_id and row_id in keep:
+            sets = ", ".join(f"{key} = :{key}" for key in values)
+            await db.execute(
+                text(f"update {table} set {sets} where id = :id and event_id = :e"),
+                {**values, "id": row_id, "e": event_id},
+            )
+            ids.append(row_id)
+        else:
+            columns = ", ".join(values)
+            placeholders = ", ".join(f":{key}" for key in values)
+            new_id = await _val(
+                db,
+                f"insert into {table} (event_id, {columns}) values (:e, {placeholders})"
+                " returning id",
+                {**values, "e": event_id},
+            )
+            ids.append(str(new_id))
+    return ids
+
+
+async def _child_ids(db: AsyncSession, table: str, event_id: UUID | str) -> list[str]:
+    assert table in CHILD_TABLES
+    return [
+        str(row["id"])
+        for row in await _all(
+            db,
+            f"select id from {table} where event_id = :e order by sort_order, created_at",
+            {"e": event_id},
+        )
+    ]
 
 
 async def _save_private(db: AsyncSession, event_id: UUID, private: dict) -> None:
@@ -293,12 +438,35 @@ def _event_values(data: dict, *, partial: bool) -> dict:
     return values
 
 
+async def _with_child_ids(
+    db: AsyncSession,
+    event_id: UUID | str,
+    ticket_ids: list[str] | None,
+    question_ids: list[str] | None,
+) -> dict:
+    """The saved event (fresh, so trigger-set prices show) and its child ids in order."""
+    event = await _event(db, event_id)
+    event["ticket_type_ids"] = (
+        ticket_ids
+        if ticket_ids is not None
+        else await _child_ids(db, "ticket_types", event_id)
+    )
+    event["question_ids"] = (
+        question_ids
+        if question_ids is not None
+        else await _child_ids(db, "event_questions", event_id)
+    )
+    return event
+
+
 async def create_event(db: AsyncSession, data: dict, user_id: UUID | str) -> dict:
     data = dict(data)
     tickets = data.pop("ticket_types", []) or []
     questions = data.pop("questions", []) or []
     private = data.pop("private", None)
     values = _event_values(data, partial=False)
+
+    _require_approved(await _organiser(db, data["organiser_id"]))
 
     event = await _one(
         db,
@@ -323,11 +491,15 @@ async def create_event(db: AsyncSession, data: dict, user_id: UUID | str) -> dic
             "currency": settings.CURRENCY,
         },
     )
-    await _insert_tickets(db, event["id"], tickets, event["currency"])
-    await _insert_questions(db, event["id"], questions)
+    ticket_ids = await _sync_children(
+        db, "ticket_types", event["id"], tickets, event["currency"], set(), []
+    )
+    question_ids = await _sync_children(
+        db, "event_questions", event["id"], questions, event["currency"], set(), []
+    )
     if private is not None:
         await _save_private(db, event["id"], private)
-    return event
+    return await _with_child_ids(db, event["id"], ticket_ids, question_ids)
 
 
 async def update_event(db: AsyncSession, event_id: UUID | str, data: dict) -> dict:
@@ -355,8 +527,17 @@ async def update_event(db: AsyncSession, event_id: UUID | str, data: dict) -> di
     }
 
     event = await _event(db, event_id)
+    _require_editable(event)
+    org = await _organiser(db, event["organiser_id"])
+    _require_approved(org)
 
     mode = values.get("registration_mode") or event["registration_mode"]
+    if (
+        event["registration_mode"] == "tickets"
+        and mode != "tickets"
+        and await _has_active_registrations(db, event_id)
+    ):
+        raise HTTPException(status.HTTP_409_CONFLICT, "has_registrations")
     if mode == "external" and not (values.get("external_url") or event["external_url"]):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -368,6 +549,24 @@ async def update_event(db: AsyncSession, event_id: UUID | str, data: dict) -> di
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "ends_at cannot be before starts_at"
         )
+
+    ticket_plan = question_plan = None
+    if tickets is not None:
+        ticket_plan = await _child_plan(db, "ticket_types", event_id, tickets)
+        removed = ticket_plan[1]
+        if removed and await _has_active_registrations(db, event_id, removed):
+            raise HTTPException(status.HTTP_409_CONFLICT, "ticket_type_has_guests")
+    if questions is not None:
+        question_plan = await _child_plan(db, "event_questions", event_id, questions)
+
+    # A live event saves with publish rules (saveEvent), so paid tickets need payouts.
+    if event["status"] == "published" and mode == "tickets":
+        prices = (
+            [ticket["price"] for ticket in tickets]
+            if tickets is not None
+            else await _ticket_prices(db, event_id)
+        )
+        _require_charges(org, prices)
 
     if values:
         sets = ", ".join(f"{key} = :{key}" for key in values)
@@ -381,27 +580,34 @@ async def update_event(db: AsyncSession, event_id: UUID | str, data: dict) -> di
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Event not found")
         event = row
 
-    if tickets is not None:
-        await db.execute(
-            text("delete from ticket_types where event_id = :e"), {"e": event_id}
+    ticket_ids = question_ids = None
+    if tickets is not None and ticket_plan is not None:
+        ticket_ids = await _sync_children(
+            db, "ticket_types", event["id"], tickets, event["currency"], *ticket_plan
         )
-        await _insert_tickets(db, event["id"], tickets, event["currency"])
-    if questions is not None:
-        await db.execute(
-            text("delete from event_questions where event_id = :e"), {"e": event_id}
+    if questions is not None and question_plan is not None:
+        question_ids = await _sync_children(
+            db, "event_questions", event["id"], questions, event["currency"], *question_plan
         )
-        await _insert_questions(db, event["id"], questions)
     if private_provided:
         await _save_private(db, event["id"], private or {})
-    return event
+    return await _with_child_ids(db, event["id"], ticket_ids, question_ids)
 
 
 async def publish_event(db: AsyncSession, event_id: UUID | str) -> dict:
     event = await _event(db, event_id)
+    if event["status"] == "published":
+        return event
+    if event["status"] != "draft":
+        raise HTTPException(status.HTTP_409_CONFLICT, "event_not_publishable")
+    org = await _organiser(db, event["organiser_id"])
+    _require_approved(org)
     if event["starts_at"] and event["starts_at"] < datetime.now(timezone.utc):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "This event has already started"
         )
+    if event["registration_mode"] == "tickets":
+        _require_charges(org, await _ticket_prices(db, event_id))
     row = await _one(
         db,
         "update events set status = 'published', published_at = now(), updated_at = now()"
@@ -414,14 +620,16 @@ async def publish_event(db: AsyncSession, event_id: UUID | str) -> dict:
 
 
 async def cancel_event(db: AsyncSession, event_id: UUID | str, reason: str) -> dict:
+    """Only a published event can be cancelled (drafts are deleted instead)."""
     row = await _one(
         db,
         "update events set status = 'cancelled', cancel_reason = :reason, updated_at = now()"
-        f" where id = :id returning {EVENT_COLUMNS}",
+        f" where id = :id and status = 'published' returning {EVENT_COLUMNS}",
         {"id": event_id, "reason": reason.strip()},
     )
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Event not found")
+        await _event(db, event_id)  # 404 when it does not exist
+        raise HTTPException(status.HTTP_409_CONFLICT, "event_not_published")
     return row
 
 
@@ -432,6 +640,174 @@ async def delete_event(db: AsyncSession, event_id: UUID | str) -> None:
             status.HTTP_409_CONFLICT, "Only drafts can be deleted — cancel it instead"
         )
     await db.execute(text("delete from events where id = :id"), {"id": event_id})
+
+
+# ─── more dates (a series) ──────────────────────────────────────────────────
+
+# Editor columns a new date copies from the event it was added to (formToEventRow).
+DATE_COPY_COLUMNS = (
+    "organiser_id, title, summary, description, cover_url, timezone, format, venue_name,"
+    " address, city, country, latitude, longitude, category_id, tags, university,"
+    " registration_mode, external_url, external_label, requires_approval, capacity,"
+    " waitlist_enabled, price_min, price_max, currency"
+)
+
+WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+MONTHS = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
+def _zone(name: Optional[str]) -> ZoneInfo:
+    try:
+        return ZoneInfo(name or settings.DEFAULT_TIMEZONE)
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo(settings.DEFAULT_TIMEZONE)
+
+
+def _shift_local_days(
+    value: Optional[datetime], days: int, tz: ZoneInfo
+) -> Optional[datetime]:
+    """The same wall-clock time `days` later in the event's zone (shiftLocalDays)."""
+    if value is None or days == 0:
+        return value
+    local = value.astimezone(tz).replace(tzinfo=None) + timedelta(days=days)
+    return local.replace(tzinfo=tz).astimezone(timezone.utc)
+
+
+def weekly_label(starts: list[datetime], tz: ZoneInfo) -> Optional[str]:
+    """"Every week on Wednesday until 9 December 2026" when the dates are exactly a
+    week apart (by local calendar day), otherwise None (repeat.ts weeklyLabel)."""
+    local = sorted(start.astimezone(tz) for start in starts)
+    if len(local) < 2:
+        return None
+    for before, after in zip(local, local[1:]):
+        if (after.date() - before.date()).days != 7:
+            return None
+    first, last = local[0], local[-1]
+    return (
+        f"Every week on {WEEKDAYS[first.weekday()]} until"
+        f" {last.day} {MONTHS[last.month - 1]} {last.year}"
+    )
+
+
+async def create_dates(
+    db: AsyncSession, event_id: UUID | str, dates: list[dict], user_id: UUID | str
+) -> dict:
+    """More dates for an event: each is its own event with the same details, tickets,
+    questions and guest-only details, all sharing one series (createMoreDates)."""
+    parent = await _event(db, event_id)
+    if parent["status"] not in ("draft", "published"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "event_not_editable")
+    org = await _organiser(db, parent["organiser_id"])
+    _require_approved(org)
+
+    series_key = parent["series_key"] or f"orbit:{parent['id']}"
+    existing = {
+        row["starts_at"]
+        for row in await _all(
+            db,
+            "select starts_at from events where series_key = :k and organiser_id = :o"
+            " and status <> 'removed'",
+            {"k": series_key, "o": parent["organiser_id"]},
+        )
+    } | {parent["starts_at"]}
+    now = datetime.now(timezone.utc)
+    for slot in dates:
+        if slot["starts_at"] <= now:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "date_in_past")
+        if slot["starts_at"] in existing:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "duplicate_date")
+
+    tickets = await _all(
+        db,
+        "select name, description, price, currency, quantity, sales_end_at, sort_order"
+        " from ticket_types where event_id = :e order by sort_order, created_at",
+        {"e": parent["id"]},
+    )
+    questions = await _all(
+        db,
+        "select label, kind, options, required, sort_order from event_questions"
+        " where event_id = :e order by sort_order, created_at",
+        {"e": parent["id"]},
+    )
+    private = await _one(
+        db,
+        "select online_url, guest_info from event_private where event_id = :e",
+        {"e": parent["id"]},
+    )
+    publish = parent["status"] == "published"
+    if publish and parent["registration_mode"] == "tickets":
+        _require_charges(org, [ticket["price"] for ticket in tickets])
+
+    if not parent["series_key"]:
+        await db.execute(
+            text("update events set series_key = :k, updated_at = now() where id = :id"),
+            {"k": series_key, "id": parent["id"]},
+        )
+
+    tz = _zone(parent["timezone"])
+    parent_day = parent["starts_at"].astimezone(tz).date()
+    created: list[dict] = []
+    for slot in dates:
+        days = (slot["starts_at"].astimezone(tz).date() - parent_day).days
+        row = await _one(
+            db,
+            f"""
+            insert into events
+              ({DATE_COPY_COLUMNS}, starts_at, ends_at, registration_deadline, series_key,
+               status, source, created_by)
+            select {DATE_COPY_COLUMNS}, :starts_at, :ends_at, :deadline, :series_key,
+                   :status, 'orbit', :created_by
+              from events where id = :parent
+            returning id, starts_at, ends_at, status
+            """,
+            {
+                "starts_at": slot["starts_at"],
+                "ends_at": slot.get("ends_at"),
+                "deadline": _shift_local_days(parent["registration_deadline"], days, tz),
+                "series_key": series_key,
+                "status": "published" if publish else "draft",
+                "created_by": user_id,
+                "parent": parent["id"],
+            },
+        )
+        shifted = [
+            {**ticket, "sales_end_at": _shift_local_days(ticket["sales_end_at"], days, tz)}
+            for ticket in tickets
+        ]
+        await _sync_children(db, "ticket_types", row["id"], shifted, parent["currency"], set(), [])
+        await _sync_children(
+            db, "event_questions", row["id"], questions, parent["currency"], set(), []
+        )
+        if private:
+            await _save_private(db, row["id"], private)
+        created.append(row)
+
+    starts = [
+        row["starts_at"]
+        for row in await _all(
+            db,
+            "select starts_at from events where series_key = :k and organiser_id = :o"
+            " and status <> 'removed'",
+            {"k": series_key, "o": parent["organiser_id"]},
+        )
+    ]
+    label = weekly_label(starts, tz)
+    await db.execute(
+        text(
+            "update events set series_label = :label, updated_at = now()"
+            " where series_key = :k and organiser_id = :o"
+        ),
+        {"label": label, "k": series_key, "o": parent["organiser_id"]},
+    )
+    return {
+        "series_key": series_key,
+        "series_label": label,
+        "count": len(created),
+        "events": created,
+    }
 
 
 # ─── stats and guests ───────────────────────────────────────────────────────
