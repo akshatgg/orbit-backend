@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import HTTPException, status
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -844,12 +845,32 @@ async def _registration_in_event(
     return row
 
 
+def _decision_refusal(exc: DBAPIError) -> HTTPException:
+    """The HTTP answer for a refusal raised by decide_registration (SQLSTATE P0001).
+
+    Anything else is a real failure and is re-raised as it was.
+    """
+    raw = getattr(exc, "orig", None)
+    if getattr(raw, "sqlstate", None) != "P0001":
+        raise exc
+    message = (str(raw).strip().splitlines() or [""])[0].strip()
+    if message.startswith("The event is full"):
+        return HTTPException(status.HTTP_409_CONFLICT, "event_full")
+    if message == "Registration not found":
+        return HTTPException(status.HTTP_404_NOT_FOUND, message)
+    return HTTPException(status.HTTP_400_BAD_REQUEST, message or "That did not work")
+
+
 async def decide(
     db: AsyncSession, event_id: UUID | str, registration_id: UUID | str, decision: str
 ) -> dict:
     await _registration_in_event(db, event_id, registration_id)
     before = await _waitlisted(db, event_id) if decision == "decline" else set()
-    row = await fn.decide_registration(db, registration_id, decision)
+    try:
+        row = await fn.decide_registration(db, registration_id, decision)
+    except DBAPIError as exc:
+        # Approving someone off the waitlist (or a declined guest) needs a free spot.
+        raise _decision_refusal(exc) from exc
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Registration not found")
     await notify_registration_changed(db, [registration_id], reason="decision")
@@ -872,6 +893,11 @@ async def _waitlisted(db: AsyncSession, event_id: UUID | str) -> set[UUID]:
 
 
 async def approve_all(db: AsyncSession, event_id: UUID | str) -> dict:
+    """Approve pending registrations oldest first, stopping at the first refusal.
+
+    Like the frontend's approveAllPending, approvals made before a refusal are kept
+    (each runs in its own savepoint) and the refusal is reported, not raised.
+    """
     ids = [
         row["id"]
         for row in await _all(
@@ -882,11 +908,18 @@ async def approve_all(db: AsyncSession, event_id: UUID | str) -> dict:
         )
     ]
     approved: list[UUID] = []
+    error: Optional[str] = None
     for registration_id in ids:
-        if await fn.decide_registration(db, registration_id, "approve"):
+        try:
+            async with db.begin_nested():
+                row = await fn.decide_registration(db, registration_id, "approve")
+        except DBAPIError as exc:
+            error = _decision_refusal(exc).detail
+            break
+        if row:
             approved.append(registration_id)
     await notify_registration_changed(db, approved, reason="approve_all")
-    return {"ok": True, "approved": len(approved), "total": len(ids)}
+    return {"ok": error is None, "approved": len(approved), "total": len(ids), "error": error}
 
 
 async def check_in(db: AsyncSession, event_id: UUID | str, code: str) -> dict:
