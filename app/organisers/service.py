@@ -11,7 +11,7 @@ from uuid import UUID
 
 from fastapi import HTTPException, status
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.pagination import offset
@@ -314,6 +314,33 @@ async def set_follow(
     return following
 
 
+# How a team or invite rule the SQL refused is answered; the body is the function's own
+# sentence, which the frontend shows as it did with the Supabase RPC error.
+REFUSAL_STATUS: tuple[tuple[str, int], ...] = (
+    ("Every organiser needs at least one owner", status.HTTP_409_CONFLICT),
+    ("That person is not on this team", status.HTTP_404_NOT_FOUND),
+    ("This invite link is not valid", status.HTTP_404_NOT_FOUND),
+    ("This invite link has been turned off", status.HTTP_409_CONFLICT),
+    ("This invite link has expired", status.HTTP_409_CONFLICT),
+    ("This invite link has reached its limit", status.HTTP_409_CONFLICT),
+    ("This organisation is not accepting team members", status.HTTP_409_CONFLICT),
+    ("Only owners can", status.HTTP_403_FORBIDDEN),
+    ("Sign in", status.HTTP_401_UNAUTHORIZED),
+)
+
+
+def _refusal(exc: DBAPIError) -> HTTPException:
+    """The HTTP answer for a refusal raised by a team/invite function; other errors re-raise."""
+    message = fn.raised_message(exc)
+    if message is None:
+        raise exc
+    code = next(
+        (code for prefix, code in REFUSAL_STATUS if message.startswith(prefix)),
+        status.HTTP_400_BAD_REQUEST,
+    )
+    return HTTPException(code, message)
+
+
 async def team(db: AsyncSession, organiser_id: UUID | str) -> list[dict]:
     return await fn.organiser_members_list(db, organiser_id)
 
@@ -321,16 +348,11 @@ async def team(db: AsyncSession, organiser_id: UUID | str) -> list[dict]:
 async def add_member(
     db: AsyncSession, organiser_id: UUID | str, email: str, role: str
 ) -> dict:
-    user_id = await _val(
-        db,
-        "select id from profiles where lower(email) = lower(:e) limit 1",
-        {"e": email.strip()},
-    )
-    if not user_id:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "No Orbit account uses that email"
-        )
-    await fn.add_organiser_member(db, organiser_id, str(email).strip(), role)
+    try:
+        # Refuses an unknown email with the sentence the team panel showed.
+        user_id = await fn.add_organiser_member(db, organiser_id, str(email).strip(), role)
+    except DBAPIError as exc:
+        raise _refusal(exc) from exc
     row = await _one(
         db,
         """
@@ -347,7 +369,10 @@ async def add_member(
 async def remove_member(
     db: AsyncSession, organiser_id: UUID | str, user_id: UUID | str
 ) -> None:
-    await fn.remove_organiser_member(db, organiser_id, user_id)
+    try:
+        await fn.remove_organiser_member(db, organiser_id, user_id)
+    except DBAPIError as exc:
+        raise _refusal(exc) from exc
 
 
 async def list_invites(
@@ -442,7 +467,10 @@ async def peek_invite(db: AsyncSession, code: str) -> dict:
 
 
 async def accept_invite(db: AsyncSession, code: str) -> dict:
-    result = await fn.accept_organiser_invite(db, code)
+    try:
+        result = await fn.accept_organiser_invite(db, code)
+    except DBAPIError as exc:
+        raise _refusal(exc) from exc
     payload = (result or {}).get("result")
     if not payload:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "This invite link is not valid")
