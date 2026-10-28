@@ -55,7 +55,8 @@ class EventCreate(BaseModel):
     organiser_id: UUID | None = None
     tags: list[str] = Field(default_factory=list)
     university: str | None = Field(default=None, max_length=120)
-    registration_mode: RegistrationMode = "tickets"
+    # Admin events register elsewhere or not at all; ticketed events belong to an organiser.
+    registration_mode: RegistrationMode = "none"
     external_url: str | None = None
     external_label: str = Field(default="Apply now", max_length=40)
     requires_approval: bool = False
@@ -66,8 +67,10 @@ class EventCreate(BaseModel):
     price_max: Decimal | None = Field(default=None, ge=0)
     currency: str = Field(default="GBP", min_length=3, max_length=3)
     is_featured: bool = False
+    # Where the admin found the event (the form's "Source link").
+    source_url: str | None = Field(default=None, max_length=2000)
 
-    @field_validator("cover_url", "external_url")
+    @field_validator("cover_url", "external_url", "source_url")
     @classmethod
     def _http_links(cls, value: str | None) -> str | None:
         return _http_url(value)
@@ -138,8 +141,9 @@ class EventUpdate(BaseModel):
     price_max: Decimal | None = Field(default=None, ge=0)
     currency: str | None = Field(default=None, min_length=3, max_length=3)
     is_featured: bool | None = None
+    source_url: str | None = Field(default=None, max_length=2000)
 
-    @field_validator("cover_url", "external_url")
+    @field_validator("cover_url", "external_url", "source_url")
     @classmethod
     def _http_links(cls, value: str | None) -> str | None:
         return _http_url(value)

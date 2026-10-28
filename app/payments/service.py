@@ -470,6 +470,8 @@ async def connect_status(db: AsyncSession, organiser_id: UUID | str) -> dict:
         "due_count": summary["due_count"] if summary else None,
         "disabled_reason": summary["disabled_reason"] if summary else None,
         "live": summary is not None,
+        # Orbit's cut of each paid ticket, in percent (0 = none), for the payouts page.
+        "fee_percent": settings.platform_fee_percent,
     }
 
 

@@ -314,6 +314,34 @@ async def feed_candidates(
     )
 
 
+# The Supabase-era `events_select` policy: anyone sees these statuses (by an approved organiser,
+# or added by an admin); the organiser's team and admins see every status.
+PUBLIC_STATUSES = ("published", "cancelled", "expired")
+
+
+# The same rule for raw SQL over `events e left join organisers o on o.id = e.organiser_id`.
+PUBLICLY_VISIBLE_SQL = (
+    "(e.status in ('published', 'cancelled', 'expired')"
+    " and (e.organiser_id is null or o.status = 'approved'))"
+)
+
+
+def publicly_visible(event: Event, organiser: Organiser | None) -> bool:
+    """Whether anyone, signed in or not, may open this event's page."""
+    return event.status in PUBLIC_STATUSES and (
+        event.organiser_id is None or (organiser is not None and organiser.status == "approved")
+    )
+
+
+async def can_view(
+    db: AsyncSession, event: Event, organiser: Organiser | None, user: dict | None
+) -> bool:
+    """The event page's visibility: public, or the viewer can manage the event."""
+    if publicly_visible(event, organiser):
+        return True
+    return bool(user) and await fn.can_manage_event(db, event.id)
+
+
 async def event_row(db: AsyncSession, event_id: UUID):
     """An event with organiser and category, or None."""
     return (await db.execute(card_query().where(Event.id == event_id))).first()
@@ -451,6 +479,9 @@ async def detail(
     return {
         **card(event, organiser, category, counts),
         "description": event.description,
+        "latitude": event.latitude,
+        "longitude": event.longitude,
+        "cancel_reason": event.cancel_reason,
         "ticket_types": [
             {**ticket_dict(ticket), "remaining": remaining.get(ticket.id)} for ticket in tickets
         ],

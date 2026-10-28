@@ -5,9 +5,10 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status as http_status
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import and_, delete, func, insert, or_, select, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.admin.models import AdminAuditLog
 from app.admin.schemas import (
@@ -31,6 +32,7 @@ from app.categories.models import Category
 from app.core.database import get_db
 from app.core.deps import require_admin, require_super_admin
 from app.core.pagination import pagination
+from app.core.routing import NumbersRoute
 from app.events.models import Event
 from app.notifications.service import (
     LOGISTICS,
@@ -45,7 +47,7 @@ from app.tickets.models import Registration
 from app.uploads.release import release_images
 from app.users.models import Profile, User
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+router = APIRouter(prefix="/admin", tags=["admin"], route_class=NumbersRoute)
 
 EVENT_STATUSES = ("draft", "published", "cancelled", "expired", "removed")
 ORGANISER_STATUSES = ("pending", "approved", "rejected", "suspended")
@@ -646,6 +648,24 @@ async def admin_delete_event(
     return {"deleted": True, "registrations": result["registrations"], "images": result["images"]}
 
 
+def _user_type_filter(user_type: str):
+    """The admin "User type" filter (the frontend's typeFilterClause): accounts from before user
+    types existed count as students when they have a university; hosts are a goal, not a type."""
+    if user_type == "host":
+        return Profile.goals.contains(["host"])
+    if user_type == "student":
+        return or_(
+            Profile.user_type == "student",
+            and_(Profile.user_type.is_(None), Profile.university.is_not(None)),
+        )
+    if user_type == "other":
+        return or_(
+            Profile.user_type == "other",
+            and_(Profile.user_type.is_(None), Profile.university.is_(None)),
+        )
+    return Profile.user_type == user_type
+
+
 @router.get("/users")
 async def admin_users(
     q: str | None = None,
@@ -660,7 +680,14 @@ async def admin_users(
     filters = []
     if q and q.strip():
         pattern = f"%{_escape_like(q)}%"
-        filters.append(Profile.full_name.ilike(pattern, escape="\\") | Profile.email.ilike(pattern, escape="\\"))
+        filters.append(
+            or_(
+                *(
+                    column.ilike(pattern, escape="\\")
+                    for column in (Profile.email, Profile.full_name, Profile.university, Profile.course)
+                )
+            )
+        )
     if only == "verified":
         filters.append(Profile.is_verified_student.is_(True))
     elif only == "unverified":
@@ -668,7 +695,7 @@ async def admin_users(
     elif only == "admins":
         filters.append(Profile.role.in_(("admin", "super_admin")))
     if user_type:
-        filters.append(Profile.user_type == user_type)
+        filters.append(_user_type_filter(user_type))
 
     total = int(
         await db.scalar(
@@ -702,6 +729,7 @@ async def admin_users(
             "user_type": profile.user_type,
             "role": profile.role,
             "is_verified_student": profile.is_verified_student,
+            "goals": list(profile.goals or []),
             "onboarded_at": profile.onboarded_at,
             "created_at": profile.created_at,
             "email_verified_at": email_verified_at,
@@ -852,11 +880,28 @@ async def admin_organisers(
         .scalar_subquery()
     )
 
+    applicant = aliased(Profile)
+    reviewer = aliased(Profile)
+
     filters = []
     if tab in ORGANISER_STATUSES:
         filters.append(Organiser.status == tab)
     if q and q.strip():
-        filters.append(Organiser.name.ilike(f"%{_escape_like(q)}%", escape="\\"))
+        # The frontend's organiser search: name, slug, contact email or university.
+        pattern = f"%{_escape_like(q)}%"
+        filters.append(
+            or_(
+                *(
+                    column.ilike(pattern, escape="\\")
+                    for column in (
+                        Organiser.name,
+                        Organiser.slug,
+                        Organiser.contact_email,
+                        Organiser.university,
+                    )
+                )
+            )
+        )
 
     order = Organiser.created_at.asc() if tab == "pending" else Organiser.created_at.desc()
     rows = (
@@ -866,13 +911,28 @@ async def admin_organisers(
                 event_count.label("event_count"),
                 member_count.label("member_count"),
                 owner_names.label("owner_names"),
+                applicant.full_name,
+                applicant.email,
+                reviewer.full_name,
+                reviewer.email,
             )
+            .outerjoin(applicant, applicant.id == Organiser.created_by)
+            .outerjoin(reviewer, reviewer.id == Organiser.reviewed_by)
             .where(*filters)
             .order_by(order)
         )
     ).all()
     items = []
-    for organiser, events, members, owners in rows:
+    for (
+        organiser,
+        events,
+        members,
+        owners,
+        applicant_name,
+        applicant_email,
+        reviewer_name,
+        reviewer_email,
+    ) in rows:
         items.append(
             {
                 "id": organiser.id,
@@ -888,7 +948,14 @@ async def admin_organisers(
                 "is_verified": organiser.is_verified,
                 "review_note": organiser.review_note,
                 "reviewed_by": organiser.reviewed_by,
+                # Who reviewed it, by name (their email when they have none), as the page shows.
+                "reviewed_by_name": reviewer_name or reviewer_email,
                 "reviewed_at": organiser.reviewed_at,
+                "stripe_charges_enabled": organiser.stripe_charges_enabled,
+                # The applicant: the account that created the organiser.
+                "created_by": organiser.created_by,
+                "created_by_name": applicant_name,
+                "created_by_email": applicant_email,
                 "created_at": organiser.created_at,
                 "event_count": int(events or 0),
                 "member_count": int(members or 0),
@@ -1085,6 +1152,9 @@ async def admin_update_category(
             raise HTTPException(
                 http_status.HTTP_422_UNPROCESSABLE_ENTITY, f"{required} cannot be empty"
             )
+    if "group" in values:
+        # "group" is reserved in SQL, so the mapped attribute is `group_name`.
+        values["group_name"] = values.pop("group")
     if values:
         try:
             await db.execute(

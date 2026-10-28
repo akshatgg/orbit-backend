@@ -8,15 +8,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.deps import require_user
+from app.core.routing import NumbersRoute
 from app.organisers.service import org_role
 
 from . import service
 from .schemas import ConnectIn
 
-router = APIRouter(tags=["payments"])
-payments_router = APIRouter(prefix="/payments", tags=["payments"])
-me_router = APIRouter(prefix="/me/tickets", tags=["payments"])
-checkout_router = APIRouter(prefix="/checkout", tags=["payments"])
+router = APIRouter(tags=["payments"], route_class=NumbersRoute)
+payments_router = APIRouter(prefix="/payments", tags=["payments"], route_class=NumbersRoute)
+me_router = APIRouter(prefix="/me/tickets", tags=["payments"], route_class=NumbersRoute)
+checkout_router = APIRouter(prefix="/checkout", tags=["payments"], route_class=NumbersRoute)
 
 
 @payments_router.post("/registrations/{registration_id}/checkout")

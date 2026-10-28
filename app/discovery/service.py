@@ -1,35 +1,22 @@
 """Explore counts, place grouping and the interest list."""
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.categories.models import Category
+from app.discovery.places import group_places
+from app.discovery.taxonomy import ALL_INTERESTS, interest_tags
 from app.events import service as events
 from app.events.models import Event
 from app.sql import functions as fn
-from app.users.models import Profile
 
 
-async def counts(db: AsyncSession, user: dict | None) -> dict:
-    """Event totals per category, plus per interest for the signed-in profile."""
-    interests: dict[str, list[str]] = {}
-    if user:
-        profile = await db.get(Profile, user["id"])
-        if profile:
-            for slug in [
-                *(profile.career_interests or []),
-                *(profile.personal_interests or []),
-            ]:
-                if slug:
-                    interests[slug] = events.interest_tags(slug)
-
+async def counts(db: AsyncSession) -> dict:
+    """Upcoming events per category and per interest, every interest whoever asks; a recurring
+    series counts once (the frontend's getDiscoveryCounts over `discovery_counts`)."""
+    interests = {value: interest_tags(value) for value, _ in ALL_INTERESTS}
     rows = await fn.discovery_counts(db, interests)
-    total = (
-        await db.scalar(
-            select(func.count()).select_from(Event).where(*events.visible())
-        )
-        or 0
-    )
+    total = next((int(row["events"] or 0) for row in rows if row["kind"] == "all"), 0)
     by_category: dict[str, int] = {}
     for row in rows:
         if row["kind"] == "category" and row["key"]:
@@ -65,29 +52,13 @@ async def counts(db: AsyncSession, user: dict | None) -> dict:
 
 
 async def places(db: AsyncSession) -> list[dict]:
-    """In-person events grouped country → city, biggest first."""
+    """Where upcoming in-person and hybrid events are, country → city, biggest first; a series
+    counts once and spellings are merged (the frontend's listUpcomingPlaces/groupPlaces)."""
     rows = (
         await db.execute(
-            select(Event.country, Event.city, func.count().label("events"))
-            .where(
-                *events.visible(),
-                Event.format == "in_person",
-                Event.country.is_not(None),
-                Event.city.is_not(None),
+            select(Event.id, Event.city, Event.country, Event.series_key).where(
+                *events.visible(), Event.format != "online"
             )
-            .group_by(Event.country, Event.city)
-            .order_by(func.count().desc(), Event.country, Event.city)
         )
-    ).all()
-
-    grouped: dict[str, dict] = {}
-    for country, city, total in rows:
-        group = grouped.setdefault(country, {"country": country, "cities": []})
-        group["cities"].append({"city": city, "events": int(total)})
-    return sorted(
-        grouped.values(),
-        key=lambda group: (
-            -sum(city["events"] for city in group["cities"]),
-            group["country"],
-        ),
-    )
+    ).mappings().all()
+    return group_places([dict(row) for row in rows])

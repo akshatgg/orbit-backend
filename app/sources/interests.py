@@ -2,23 +2,19 @@
 
 Pure keyword scoring, no model: the event's own words decide most tags, and what the
 platform says about the event (its category, a group's topics) adds weighted evidence.
-The interest values are the frontend taxonomy's (`src/lib/taxonomy.ts` ALL_INTERESTS):
-production tags already use them.
+The interest values are the frontend taxonomy's (`app/discovery/taxonomy.py`, a port of
+`src/lib/taxonomy.ts`): production tags already use them.
 """
 
 from typing import Any, Iterable
 
 from app.connectors.base import HINT_WEIGHT
+from app.discovery import taxonomy
 
 from .classify import contains, normalize
 
-# ALL_INTERESTS: career interests then personal ones, each once.
-ALL_INTERESTS: tuple[str, ...] = (
-    "consulting", "finance", "technology", "marketing", "entrepreneurship", "product", "data", "sustainability",
-    "healthcare", "public-sector", "law", "creative", "ai", "crypto", "careers", "science",
-    "socialising", "fitness", "travel", "arts", "music", "food", "wellbeing", "volunteering", "gaming", "books",
-    "growth", "hobbies",
-)
+# The interest values, career then personal, each once: the taxonomy's own list.
+ALL_INTERESTS: tuple[str, ...] = tuple(value for value, _ in taxonomy.ALL_INTERESTS)
 _VALUES = set(ALL_INTERESTS)
 
 # Words and phrases (already normalised) that signal each interest.

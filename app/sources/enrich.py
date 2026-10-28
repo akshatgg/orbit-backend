@@ -41,7 +41,7 @@ from app.sources.enrich_plan import (
     reread_for_country,
 )
 from app.sources.models import SourceEventDetails
-from app.sources.places import normalise_country
+from app.discovery.places import normalise_country
 
 NO_COVER = "No cover image on the page."
 NO_PRICE = "No price on the page."

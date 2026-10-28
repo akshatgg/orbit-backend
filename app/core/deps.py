@@ -6,6 +6,7 @@ still receives the acting user (so `auth.uid()` inside the ported functions
 answers correctly), but the decision is made here — one place to read.
 """
 
+import hmac
 from typing import Optional
 
 from fastapi import Depends, Header, HTTPException, Request, status
@@ -120,5 +121,8 @@ async def require_event_manager(
 
 async def require_cron(authorization: str = Header(default="")) -> None:
     expected = f"Bearer {settings.CRON_SECRET}"
-    if not settings.CRON_SECRET or authorization != expected:
+    # Constant-time comparison, so response timing says nothing about the secret.
+    if not settings.CRON_SECRET or not hmac.compare_digest(
+        authorization.encode("utf-8"), expected.encode("utf-8")
+    ):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Unauthorized")

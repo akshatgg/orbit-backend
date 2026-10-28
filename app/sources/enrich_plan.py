@@ -7,9 +7,9 @@ from typing import Any, Callable
 
 from app.connectors import js
 from app.connectors.platforms import luma_page_url
+from app.discovery.places import normalise_country, place_of
 
 from .interests import with_interests
-from .places import normalise_country, place_of
 
 ENRICH_LIMIT = 25  # pages per source per run
 MAX_ATTEMPTS = 3

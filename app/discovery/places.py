@@ -1,10 +1,299 @@
-"""Well-known cities and their other spellings, for the Location filter.
+"""Countries and well-known cities (port of the frontend's `src/lib/places.ts`).
 
-Port of the parts of the frontend's `src/lib/places.ts` that search uses. Events that only store a
-city (organiser events, plain calendar feeds) still match a country through this table.
+The one places module: the importers normalise a platform's country with it, and search and the
+Location filter use its city spellings. Events that only store a city (organiser events, plain
+calendar feeds) still get a country through `KNOWN_CITIES`.
+
+`COUNTRY_NAMES` is every two-letter region `Intl.DisplayNames(["en"], {type: "region"})`
+names in Node (ICU 78): the set `normaliseCountry` accepts, so codes and country names
+normalise exactly as they did in the TypeScript engine.
 """
 
 import re
+
+from app.connectors import js
+
+COUNTRY_NAMES: dict[str, str] = {
+    "AC": "Ascension Island",
+    "AD": "Andorra",
+    "AE": "United Arab Emirates",
+    "AF": "Afghanistan",
+    "AG": "Antigua & Barbuda",
+    "AI": "Anguilla",
+    "AL": "Albania",
+    "AM": "Armenia",
+    "AN": "Curaçao",
+    "AO": "Angola",
+    "AQ": "Antarctica",
+    "AR": "Argentina",
+    "AS": "American Samoa",
+    "AT": "Austria",
+    "AU": "Australia",
+    "AW": "Aruba",
+    "AX": "Åland Islands",
+    "AZ": "Azerbaijan",
+    "BA": "Bosnia & Herzegovina",
+    "BB": "Barbados",
+    "BD": "Bangladesh",
+    "BE": "Belgium",
+    "BF": "Burkina Faso",
+    "BG": "Bulgaria",
+    "BH": "Bahrain",
+    "BI": "Burundi",
+    "BJ": "Benin",
+    "BL": "St. Barthélemy",
+    "BM": "Bermuda",
+    "BN": "Brunei",
+    "BO": "Bolivia",
+    "BQ": "Caribbean Netherlands",
+    "BR": "Brazil",
+    "BS": "Bahamas",
+    "BT": "Bhutan",
+    "BU": "Myanmar (Burma)",
+    "BV": "Bouvet Island",
+    "BW": "Botswana",
+    "BY": "Belarus",
+    "BZ": "Belize",
+    "CA": "Canada",
+    "CC": "Cocos (Keeling) Islands",
+    "CD": "Congo - Kinshasa",
+    "CF": "Central African Republic",
+    "CG": "Congo - Brazzaville",
+    "CH": "Switzerland",
+    "CI": "Côte d’Ivoire",
+    "CK": "Cook Islands",
+    "CL": "Chile",
+    "CM": "Cameroon",
+    "CN": "China",
+    "CO": "Colombia",
+    "CP": "Clipperton Island",
+    "CQ": "Sark",
+    "CR": "Costa Rica",
+    "CS": "Serbia",
+    "CU": "Cuba",
+    "CV": "Cape Verde",
+    "CW": "Curaçao",
+    "CX": "Christmas Island",
+    "CY": "Cyprus",
+    "CZ": "Czechia",
+    "DD": "Germany",
+    "DE": "Germany",
+    "DG": "Diego Garcia",
+    "DJ": "Djibouti",
+    "DK": "Denmark",
+    "DM": "Dominica",
+    "DO": "Dominican Republic",
+    "DY": "Benin",
+    "DZ": "Algeria",
+    "EA": "Ceuta & Melilla",
+    "EC": "Ecuador",
+    "EE": "Estonia",
+    "EG": "Egypt",
+    "EH": "Western Sahara",
+    "ER": "Eritrea",
+    "ES": "Spain",
+    "ET": "Ethiopia",
+    "EU": "European Union",
+    "EZ": "Eurozone",
+    "FI": "Finland",
+    "FJ": "Fiji",
+    "FK": "Falkland Islands",
+    "FM": "Micronesia",
+    "FO": "Faroe Islands",
+    "FR": "France",
+    "FX": "France",
+    "GA": "Gabon",
+    "GB": "United Kingdom",
+    "GD": "Grenada",
+    "GE": "Georgia",
+    "GF": "French Guiana",
+    "GG": "Guernsey",
+    "GH": "Ghana",
+    "GI": "Gibraltar",
+    "GL": "Greenland",
+    "GM": "Gambia",
+    "GN": "Guinea",
+    "GP": "Guadeloupe",
+    "GQ": "Equatorial Guinea",
+    "GR": "Greece",
+    "GS": "South Georgia & South Sandwich Islands",
+    "GT": "Guatemala",
+    "GU": "Guam",
+    "GW": "Guinea-Bissau",
+    "GY": "Guyana",
+    "HK": "Hong Kong SAR China",
+    "HM": "Heard & McDonald Islands",
+    "HN": "Honduras",
+    "HR": "Croatia",
+    "HT": "Haiti",
+    "HU": "Hungary",
+    "HV": "Burkina Faso",
+    "IC": "Canary Islands",
+    "ID": "Indonesia",
+    "IE": "Ireland",
+    "IL": "Israel",
+    "IM": "Isle of Man",
+    "IN": "India",
+    "IO": "British Indian Ocean Territory",
+    "IQ": "Iraq",
+    "IR": "Iran",
+    "IS": "Iceland",
+    "IT": "Italy",
+    "JE": "Jersey",
+    "JM": "Jamaica",
+    "JO": "Jordan",
+    "JP": "Japan",
+    "KE": "Kenya",
+    "KG": "Kyrgyzstan",
+    "KH": "Cambodia",
+    "KI": "Kiribati",
+    "KM": "Comoros",
+    "KN": "St. Kitts & Nevis",
+    "KP": "North Korea",
+    "KR": "South Korea",
+    "KW": "Kuwait",
+    "KY": "Cayman Islands",
+    "KZ": "Kazakhstan",
+    "LA": "Laos",
+    "LB": "Lebanon",
+    "LC": "St. Lucia",
+    "LI": "Liechtenstein",
+    "LK": "Sri Lanka",
+    "LR": "Liberia",
+    "LS": "Lesotho",
+    "LT": "Lithuania",
+    "LU": "Luxembourg",
+    "LV": "Latvia",
+    "LY": "Libya",
+    "MA": "Morocco",
+    "MC": "Monaco",
+    "MD": "Moldova",
+    "ME": "Montenegro",
+    "MF": "St. Martin",
+    "MG": "Madagascar",
+    "MH": "Marshall Islands",
+    "MK": "North Macedonia",
+    "ML": "Mali",
+    "MM": "Myanmar (Burma)",
+    "MN": "Mongolia",
+    "MO": "Macao SAR China",
+    "MP": "Northern Mariana Islands",
+    "MQ": "Martinique",
+    "MR": "Mauritania",
+    "MS": "Montserrat",
+    "MT": "Malta",
+    "MU": "Mauritius",
+    "MV": "Maldives",
+    "MW": "Malawi",
+    "MX": "Mexico",
+    "MY": "Malaysia",
+    "MZ": "Mozambique",
+    "NA": "Namibia",
+    "NC": "New Caledonia",
+    "NE": "Niger",
+    "NF": "Norfolk Island",
+    "NG": "Nigeria",
+    "NH": "Vanuatu",
+    "NI": "Nicaragua",
+    "NL": "Netherlands",
+    "NO": "Norway",
+    "NP": "Nepal",
+    "NR": "Nauru",
+    "NU": "Niue",
+    "NZ": "New Zealand",
+    "OM": "Oman",
+    "PA": "Panama",
+    "PE": "Peru",
+    "PF": "French Polynesia",
+    "PG": "Papua New Guinea",
+    "PH": "Philippines",
+    "PK": "Pakistan",
+    "PL": "Poland",
+    "PM": "St. Pierre & Miquelon",
+    "PN": "Pitcairn Islands",
+    "PR": "Puerto Rico",
+    "PS": "Palestinian Territories",
+    "PT": "Portugal",
+    "PW": "Palau",
+    "PY": "Paraguay",
+    "QA": "Qatar",
+    "QO": "Outlying Oceania",
+    "RE": "Réunion",
+    "RH": "Zimbabwe",
+    "RO": "Romania",
+    "RS": "Serbia",
+    "RU": "Russia",
+    "RW": "Rwanda",
+    "SA": "Saudi Arabia",
+    "SB": "Solomon Islands",
+    "SC": "Seychelles",
+    "SD": "Sudan",
+    "SE": "Sweden",
+    "SG": "Singapore",
+    "SH": "St. Helena",
+    "SI": "Slovenia",
+    "SJ": "Svalbard & Jan Mayen",
+    "SK": "Slovakia",
+    "SL": "Sierra Leone",
+    "SM": "San Marino",
+    "SN": "Senegal",
+    "SO": "Somalia",
+    "SR": "Suriname",
+    "SS": "South Sudan",
+    "ST": "São Tomé & Príncipe",
+    "SU": "Russia",
+    "SV": "El Salvador",
+    "SX": "Sint Maarten",
+    "SY": "Syria",
+    "SZ": "Eswatini",
+    "TA": "Tristan da Cunha",
+    "TC": "Turks & Caicos Islands",
+    "TD": "Chad",
+    "TF": "French Southern Territories",
+    "TG": "Togo",
+    "TH": "Thailand",
+    "TJ": "Tajikistan",
+    "TK": "Tokelau",
+    "TL": "Timor-Leste",
+    "TM": "Turkmenistan",
+    "TN": "Tunisia",
+    "TO": "Tonga",
+    "TP": "Timor-Leste",
+    "TR": "Türkiye",
+    "TT": "Trinidad & Tobago",
+    "TV": "Tuvalu",
+    "TW": "Taiwan",
+    "TZ": "Tanzania",
+    "UA": "Ukraine",
+    "UG": "Uganda",
+    "UK": "United Kingdom",
+    "UM": "U.S. Outlying Islands",
+    "UN": "United Nations",
+    "US": "United States",
+    "UY": "Uruguay",
+    "UZ": "Uzbekistan",
+    "VA": "Vatican City",
+    "VC": "St. Vincent & Grenadines",
+    "VD": "Vietnam",
+    "VE": "Venezuela",
+    "VG": "British Virgin Islands",
+    "VI": "U.S. Virgin Islands",
+    "VN": "Vietnam",
+    "VU": "Vanuatu",
+    "WF": "Wallis & Futuna",
+    "WS": "Samoa",
+    "XA": "Pseudo-Accents",
+    "XB": "Pseudo-Bidi",
+    "XK": "Kosovo",
+    "YD": "Yemen",
+    "YE": "Yemen",
+    "YT": "Mayotte",
+    "YU": "Serbia",
+    "ZA": "South Africa",
+    "ZM": "Zambia",
+    "ZR": "Congo - Kinshasa",
+    "ZW": "Zimbabwe",
+}
 
 _GB = [
     "London", "Manchester", "Birmingham", "Leeds", "Liverpool", "Glasgow", "Edinburgh", "Bristol", "Sheffield",
@@ -47,11 +336,11 @@ KNOWN_CITIES: list[tuple[str, str, tuple[str, ...]]] = [
     ("Sydney", "AU", ()),
 ]
 
-_SPACES = re.compile(r"\s+")
+_SPACES = re.compile(f"{js.S}+")
 
 
 def _key(value: str) -> str:
-    return _SPACES.sub(" ", value.strip().lower())
+    return _SPACES.sub(" ", js.trim(value).lower())
 
 
 _BY_NAME: dict[str, tuple[str, str, tuple[str, ...]]] = {}
@@ -59,11 +348,40 @@ for _known in KNOWN_CITIES:
     for _name in (_known[0], *_known[2]):
         _BY_NAME[_key(_name)] = _known
 
+_CODE_BY_NAME: dict[str, str] = {
+    "uk": "GB", "great britain": "GB", "britain": "GB", "england": "GB", "scotland": "GB", "wales": "GB",
+    "northern ireland": "GB", "usa": "US", "us": "US", "united states of america": "US", "uae": "AE",
+}
+for _code, _country in COUNTRY_NAMES.items():
+    _CODE_BY_NAME.setdefault(_key(_country), _code)
+
+_TWO_LETTERS = re.compile(r"^[A-Za-z]{2}$")
+
+
+def normalise_country(raw: object) -> str | None:
+    """A platform's country ("gb", "IN", "United Kingdom") as an ISO code, or None."""
+    if not isinstance(raw, str) or not js.trim(raw):
+        return None
+    value = js.trim(raw)
+    if _TWO_LETTERS.match(value):
+        code = value.upper()
+        if code == "UK":
+            return "GB"
+        return code if code in COUNTRY_NAMES else None
+    return _CODE_BY_NAME.get(_key(value))
+
 
 def canonical_city(city: str) -> str:
     """The usual name for a city ("Bangalore" -> "Bengaluru"); unknown cities are just tidied."""
     known = _BY_NAME.get(_key(city))
-    return known[0] if known else _SPACES.sub(" ", city.strip())
+    return known[0] if known else _SPACES.sub(" ", js.trim(city))
+
+
+def place_of(city: str | None, country: str | None) -> dict[str, str | None]:
+    """Where an event is: its stored country, else the country of a known city."""
+    name = canonical_city(city) if isinstance(city, str) and js.trim(city) else None
+    known = _BY_NAME.get(_key(name)) if name else None
+    return {"country": normalise_country(country) or (known[1] if known else None), "city": name}
 
 
 def city_variants(city: str) -> list[str]:
@@ -73,13 +391,67 @@ def city_variants(city: str) -> list[str]:
 
 
 def known_city_names(country: str) -> list[str]:
-    """Known cities of a country, every spelling."""
+    """Known cities of a country, every spelling (events without a stored country still match it)."""
     return [name for city, code, aliases in KNOWN_CITIES if code == country for name in (city, *aliases)]
 
 
 _NOT_LOCATION = re.compile(r"[^\w '&-]|_")
+_LOCATION_SPACES = re.compile(r"\s+")
 
 
 def clean_location(raw: str) -> str:
     """Letters, numbers, spaces and a little punctuation (the frontend's `cleanLocation`)."""
-    return _SPACES.sub(" ", _NOT_LOCATION.sub(" ", raw)).strip()[:60]
+    return _LOCATION_SPACES.sub(" ", _NOT_LOCATION.sub(" ", raw)).strip()[:60]
+
+
+def country_name(code: str) -> str:
+    """"IN" -> "India", "GB" -> "United Kingdom"."""
+    return COUNTRY_NAMES.get(code, code)
+
+
+_COUNTRY_CODE = re.compile(r"^[A-Z]{2}$")
+
+
+def country_flag(code: str) -> str:
+    """"IN" -> the Indian flag emoji."""
+    return "".join(chr(0x1F1A5 + ord(c)) for c in code) if _COUNTRY_CODE.match(code) else ""
+
+
+def _collate(value: str) -> tuple[str, str]:
+    """Roughly `localeCompare` order: letters before case, then case."""
+    return (value.casefold(), value)
+
+
+def group_places(rows: list[dict]) -> list[dict]:
+    """Upcoming events as country → city lists with counts, biggest first (`groupPlaces`).
+
+    `rows` carry `id`, `city`, `country`, `series_key`. A recurring series counts once. Places
+    without a known country come last as "Other places".
+    """
+    countries: dict[str, dict] = {}
+    for row in rows:
+        place = place_of(row["city"], row["country"])
+        if not place["country"] and not place["city"]:
+            continue
+        key = row["series_key"] or str(row["id"])
+        group = countries.setdefault(place["country"] or "", {"all": set(), "cities": {}})
+        group["all"].add(key)
+        if place["city"]:
+            group["cities"].setdefault(place["city"], set()).add(key)
+    groups = [
+        {
+            "country": code or None,
+            "name": country_name(code) if code else "Other places",
+            "flag": country_flag(code) if code else "",
+            "events": len(group["all"]),
+            "cities": sorted(
+                ({"city": city, "events": len(keys)} for city, keys in group["cities"].items()),
+                key=lambda c: (-c["events"], _collate(c["city"])),
+            ),
+        }
+        for code, group in countries.items()
+    ]
+    return sorted(
+        (g for g in groups if g["country"] or g["cities"]),
+        key=lambda g: (g["country"] is None, -g["events"], _collate(g["name"])),
+    )

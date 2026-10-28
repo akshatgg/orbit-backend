@@ -15,6 +15,7 @@ from app.categories.models import Category
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import require_admin
+from app.core.routing import NumbersRoute
 from app.events.models import Event
 from app.organisers.models import Organiser
 from app.sources.models import EventDuplicateDismissal, EventSource, SourceEventDetails, SourceRun
@@ -37,9 +38,9 @@ from app.sources.service import (
 )
 from app.uploads.release import release_images
 
-router = APIRouter(prefix="/admin/sources", tags=["admin:sources"])
+router = APIRouter(prefix="/admin/sources", tags=["admin:sources"], route_class=NumbersRoute)
 
-SOURCE_LABELS = {"orbit": "ORBIT (organiser)", "csv": "CSV import"}
+SOURCE_LABELS = {"orbit": "ORBIT (organiser)", "manual": "Added by an admin", "csv": "CSV import"}
 IMPORTED_KINDS = {"luma", "luma-discover", "meetup", "meetup-search", "eventbrite", "fatsoma"}
 # Kinds whose feed doesn't own the description, so an admin's one survives every sync.
 EDITABLE_DESCRIPTION = {"luma", "luma-discover", "eventbrite"}
@@ -120,6 +121,32 @@ def _event_summary(event: Event, source_names: dict[str, str]) -> dict[str, Any]
         "organiser_id": event.organiser_id,
         "category_id": event.category_id,
     }
+
+
+async def _with_names(db: AsyncSession, summaries: list[dict[str, Any] | None]) -> None:
+    """Add `organiser` and `category` ({id, name} or null) to event summaries, as the review
+    queue's REVIEW_EVENT_SELECT had them."""
+    items = [item for item in summaries if item]
+    organiser_ids = {item["organiser_id"] for item in items if item["organiser_id"]}
+    category_ids = {item["category_id"] for item in items if item["category_id"]}
+    organisers = (
+        dict((await db.execute(select(Organiser.id, Organiser.name).where(Organiser.id.in_(organiser_ids)))).all())
+        if organiser_ids
+        else {}
+    )
+    categories = (
+        dict((await db.execute(select(Category.id, Category.name).where(Category.id.in_(category_ids)))).all())
+        if category_ids
+        else {}
+    )
+    for item in items:
+        organiser_id, category_id = item["organiser_id"], item["category_id"]
+        item["organiser"] = (
+            {"id": organiser_id, "name": organisers[organiser_id]} if organiser_id in organisers else None
+        )
+        item["category"] = (
+            {"id": category_id, "name": categories[category_id]} if category_id in categories else None
+        )
 
 
 def _source_label(source: str, names: dict[str, str]) -> str:
@@ -413,6 +440,7 @@ async def review_missing(
         item["reason"] = "missing" if missing else "flagged"
         item["days_away"] = _days_away(event.starts_at, now)
         items.append(item)
+    await _with_names(db, items)
     return {
         "items": items,
         "total": total,
@@ -455,6 +483,7 @@ async def review_duplicates(
         }
         for event in events
     ]
+    await _with_names(db, [part for item in items for part in (item["event"], item["original"])])
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
@@ -488,6 +517,7 @@ async def review_hidden(
         }
         for event in events
     ]
+    await _with_names(db, [part for item in items for part in (item["event"], item["original"])])
     return {"items": items, "total": len(items), "page": 1, "page_size": len(items)}
 
 
@@ -622,14 +652,15 @@ async def update_imported(
             values.pop("price_max", None)
         elif new_min is not None and "currency" not in values:
             values["currency"] = "GBP"
-    if not values:
-        return {"ok": True, "event": _event_summary(event, await _source_names(db))}
-    values["updated_at"] = _now()
-    await db.execute(update(Event).where(Event.id == event_id).values(**values))
-    refreshed = (
-        await db.execute(select(Event).where(Event.id == event_id))
-    ).scalar_one()
-    return {"ok": True, "event": _event_summary(refreshed, await _source_names(db))}
+    if values:
+        values["updated_at"] = _now()
+        await db.execute(update(Event).where(Event.id == event_id).values(**values))
+        event = (
+            await db.execute(select(Event).where(Event.id == event_id))
+        ).scalar_one()
+    summary = _event_summary(event, await _source_names(db))
+    await _with_names(db, [summary])
+    return {"ok": True, "event": summary}
 
 
 @router.post("/imported/{event_id}/retry-details")
@@ -860,6 +891,6 @@ async def run_now(
         )
     await db.commit()  # the run uses its own trusted session; don't hold this transaction open
     summary = await run_source(source_id, trigger="manual")
-    if summary["status"] == "ok":
-        await detect_duplicates_now()
+    # How many possible duplicates the run turned up ("· 3 possible duplicates").
+    summary["duplicates"] = await detect_duplicates_now() if summary["status"] == "ok" else 0
     return summary

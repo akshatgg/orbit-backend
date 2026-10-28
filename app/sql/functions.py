@@ -12,6 +12,7 @@ from typing import Any, Optional
 from uuid import UUID
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -28,6 +29,15 @@ async def _rows(db: AsyncSession, sql: str, params: dict[str, Any]) -> list[dict
 async def _row(db: AsyncSession, sql: str, params: dict[str, Any]) -> Optional[dict[str, Any]]:
     r = (await db.execute(text(sql), params)).mappings().first()
     return dict(r) if r else None
+
+
+def raised_message(exc: DBAPIError) -> Optional[str]:
+    """The sentence a function refused with (`raise exception`, SQLSTATE P0001), or None when
+    the error is anything else (a real failure)."""
+    raw = getattr(exc, "orig", None)
+    if getattr(raw, "sqlstate", None) != "P0001":
+        return None
+    return (str(raw).strip().splitlines() or [""])[0].strip() or None
 
 
 # ─── identity / authorisation helpers (also used by RLS-era guards) ─────────

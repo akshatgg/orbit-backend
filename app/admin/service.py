@@ -49,6 +49,7 @@ EDITABLE_FIELDS: tuple[str, ...] = (
     "price_max",
     "currency",
     "is_featured",
+    "source_url",
 )
 
 _TIMESTAMP_FIELDS = {"starts_at", "ends_at", "registration_deadline"}
@@ -99,15 +100,27 @@ def _validate(values: dict[str, Any]) -> None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Title must be 3–140 characters")
 
 
+# Orbit tickets (prices, payouts, guests) are run from the organiser's event page; the admin
+# form only handles external and info-only events (the frontend's saveEvent).
+TICKETS_ON_ORGANISER_PAGE = "edit_from_organiser_page"
+
+
+def _refuse_tickets() -> HTTPException:
+    return HTTPException(status.HTTP_409_CONFLICT, TICKETS_ON_ORGANISER_PAGE)
+
+
 async def create_event(db: AsyncSession, payload: EventCreate, actor_id: UUID) -> UUID:
-    """Insert an admin-created published event with Orbit provenance."""
+    """Insert an admin-created published event (source "manual")."""
+    if payload.registration_mode == "tickets":
+        raise _refuse_tickets()
     values = _convert(payload.model_dump())
     _validate(values)
     now = _now()
     values.update(
         {
             "status": "published",
-            "source": "orbit",
+            # Added by an admin, as the frontend stored it (not an organiser's "orbit" event).
+            "source": "manual",
             "published_at": now,
             "created_by": actor_id,
             "needs_review": False,
@@ -131,13 +144,16 @@ async def create_event(db: AsyncSession, payload: EventCreate, actor_id: UUID) -
 
 
 async def update_event(db: AsyncSession, event: Event, payload: EventUpdate) -> None:
-    """Apply an admin edit, locking tags when the admin supplies their own."""
+    """Apply an admin edit. Tags edited by hand are locked against feed syncs (only when the
+    list really changed, so a removed interest stays removed); ticketed events are refused."""
     supplied = payload.model_dump(exclude_unset=True)
     changes = _convert(supplied)
+    if event.registration_mode == "tickets" or changes.get("registration_mode") == "tickets":
+        raise _refuse_tickets()
     merged = {field: getattr(event, field) for field in EDITABLE_FIELDS}
     merged.update(changes)
     _validate(merged)
-    if "tags" in changes:
+    if "tags" in changes and sorted(changes["tags"] or []) != sorted(event.tags or []):
         changes["tags_locked"] = True
     changes["updated_at"] = _now()
     try:

@@ -41,7 +41,7 @@ from app.sources.enrich import (
 from app.sources.enrich_plan import ENRICH_BUDGET_MS, RUN_ENRICH_DEADLINE_MS, RunState
 from app.sources.interests import with_interests
 from app.sources.models import EventDuplicateDismissal, EventSource, SourceRun
-from app.sources.places import normalise_country
+from app.discovery.places import normalise_country
 from app.sources.repeats import group_repeats
 
 logger = logging.getLogger(__name__)
