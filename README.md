@@ -54,7 +54,7 @@ app/
   studio/              organiser dashboard, event editing, guests, check-in
   tickets/             ticket types, questions, registrations (models)
   payments/            Stripe checkout, Connect, webhook
-  notifications/       preferences, push subscriptions, email
+  notifications/       preferences, push subscriptions, web push + email delivery
   groups/              Circles and Communities
   admin/               overview, events, users, organisers, categories, CSV
   sources/             feeds, sync engine, review queue, duplicates
@@ -107,7 +107,7 @@ Both are `GET` and need `Authorization: Bearer $CRON_SECRET`.
 | Job | Path | Schedule |
 |---|---|---|
 | Refresh sources, expire, dedupe | `/api/cron/refresh-sources` | `0 3 * * *` |
-| Reminders (event + deadline) | `/api/cron/reminders` | `0 8 * * *` |
+| Reminders (event + deadline; each person picks 2h or 24h) | `/api/cron/reminders` | `0 8 * * *` |
 
 `POST /api/cron/refresh-sources` is the admin "refresh now" button (needs an
 admin token), not a cron target.

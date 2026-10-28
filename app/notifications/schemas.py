@@ -21,6 +21,7 @@ class PushSubscriptionBody(BaseModel):
     endpoint: str = Field(min_length=1, max_length=1000)
     keys: PushKeys
     user_agent: str | None = Field(default=None, max_length=300)
+    old_endpoint: str | None = Field(default=None, max_length=1000)
 
     @field_validator("endpoint")
     @classmethod

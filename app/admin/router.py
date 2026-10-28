@@ -32,6 +32,12 @@ from app.core.database import get_db
 from app.core.deps import require_admin, require_super_admin
 from app.core.pagination import pagination
 from app.events.models import Event
+from app.notifications.service import (
+    LOGISTICS,
+    logistics_changed,
+    notify_event_changed,
+    notify_organiser_decision,
+)
 from app.organisers.models import Organiser, OrganiserMember
 from app.sources.models import EventSource
 from app.sql import functions as fn
@@ -512,10 +518,18 @@ async def admin_update_event(
     db: AsyncSession = Depends(get_db),
     admin: dict = Depends(require_admin),
 ) -> dict[str, Any]:
-    """Edit an event; supplying tags locks them against feed syncs."""
+    """Edit an event; supplying tags locks them against feed syncs.
+
+    Guests and savers of a published event hear when its time or place moved.
+    """
     event = await _get_event(db, event_id)
+    before = {key: getattr(event, key) for key in LOGISTICS}
     await update_event(db, event, body)
-    return _event_dict(await _get_event(db, event_id))
+    updated = await _get_event(db, event_id)
+    after = {key: getattr(updated, key) for key in LOGISTICS}
+    if updated.status == "published" and logistics_changed(before, after):
+        await notify_event_changed(db, event_id, "updated")
+    return _event_dict(updated)
 
 
 @router.post("/events/{event_id}/feature")
@@ -557,6 +571,7 @@ async def admin_cancel_event(
     await fn.log_admin_action(
         db, "event.cancel", "event", str(event_id), {"title": event.title, "reason": body.reason}
     )
+    await notify_event_changed(db, event_id, "cancelled")
     return {"id": event_id, "status": "cancelled", "cancel_reason": body.reason}
 
 
@@ -924,6 +939,7 @@ async def admin_organiser_decision(
     ).scalar_one_or_none()
     if organiser is None:
         raise HTTPException(http_status.HTTP_404_NOT_FOUND, "Organiser not found")
+    previous = organiser.status
     now = _now()
     await db.execute(
         update(Organiser)
@@ -943,6 +959,9 @@ async def admin_organiser_decision(
         str(organiser_id),
         {"name": organiser.name, "note": body.note},
     )
+    # Owners hear about approvals and rejections (only when the status changed).
+    if body.decision != previous:
+        await notify_organiser_decision(db, organiser_id, body.decision)
     return {"id": organiser_id, "status": body.decision, "review_note": body.note}
 
 
