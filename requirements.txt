@@ -16,6 +16,8 @@ PyJWT[crypto]>=2.10
 bcrypt>=4.2,<5
 python-multipart>=0.0.20
 httpx>=0.28
+# Host names in importer URLs (WHATWG/UTS-46); already installed by httpx, imported directly.
+idna>=3.7
 email-validator>=2.2
 icalendar>=6.1
 python-dateutil>=2.9
