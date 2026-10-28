@@ -87,7 +87,7 @@ class Event(Base):
     )
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Product/import provenance. `source` is 'orbit' for hand-made events and
-    # 'src-<uuid>' for each imported feed, matching Orbit's sourceKey().
+    # 'source:<uuid>' for each imported feed, matching Orbit's sourceKey().
     source: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'orbit'"))
     source_url: Mapped[str | None] = mapped_column(Text)
     source_event_id: Mapped[str | None] = mapped_column(Text)

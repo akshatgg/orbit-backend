@@ -203,7 +203,7 @@ async def _imported_events(db: AsyncSession, limit: int) -> list[dict[str, Any]]
         )
     ).all()
     kinds = {
-        f"src-{row[0]}": row[1]
+        f"source:{row[0]}": row[1]
         for row in (await db.execute(select(EventSource.id, EventSource.kind))).all()
     }
     items = []
@@ -584,7 +584,7 @@ async def update_imported(
     ).scalar_one_or_none()
     if event is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "That event no longer exists.")
-    if not event.source.startswith("src-"):
+    if not event.source.startswith("source:"):
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, "Only imported platform events can be edited here."
         )

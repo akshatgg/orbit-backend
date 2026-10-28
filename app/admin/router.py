@@ -114,14 +114,14 @@ def _source_label(source: str, names: dict[str, str]) -> str:
         return "Added by an admin"
     if source == "csv":
         return "CSV import"
-    if source.startswith("src-"):
+    if source.startswith("source:"):
         return names.get(source, "Deleted source")
     return source
 
 
 async def _source_names(db: AsyncSession) -> dict[str, str]:
     rows = (await db.execute(select(EventSource.id, EventSource.name))).all()
-    return {f"src-{row[0]}": row[1] for row in rows}
+    return {f"source:{row[0]}": row[1] for row in rows}
 
 
 async def _get_event(db: AsyncSession, event_id: UUID) -> Event:
