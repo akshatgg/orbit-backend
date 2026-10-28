@@ -151,7 +151,8 @@ class SmtpConfig:
 
 @dataclass
 class EmailChannel:
-    # "log": local development with no provider; the email is logged and counted as sent.
+    # "log": local development with no provider; the email is printed to the log (so a magic
+    # link can be followed) but nothing is sent, so it never counts as delivered.
     kind: Literal["smtp", "resend", "log", "none"]
     sender: str = ""
     smtp: Optional[SmtpConfig] = None
@@ -193,7 +194,9 @@ def email_channel() -> EmailChannel:
 
 
 def email_available() -> bool:
-    return email_channel().kind != "none"
+    """Whether email can actually be delivered (SMTP or Resend), as the frontend's
+    isEmailConfigured: without a provider, notifications plan no email and count none."""
+    return email_channel().kind in ("smtp", "resend")
 
 
 def channels_available() -> dict[str, bool]:
@@ -279,7 +282,7 @@ async def send_emails(jobs: list[tuple[str, RenderedEmail]]) -> list[bool]:
                     email.subject,
                     email.text,
                 )
-            return [True] * len(jobs)
+            return [False] * len(jobs)
         if channel.kind == "smtp" and channel.smtp:
             return await asyncio.to_thread(_smtp_send, channel.smtp, channel.sender, jobs)
         return await _resend_send(channel.api_key or "", channel.sender, jobs)

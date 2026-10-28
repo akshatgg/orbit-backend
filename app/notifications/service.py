@@ -578,6 +578,12 @@ async def _send_organiser_decision(
         if available["email"] and user_id in recipients.emails:
             emails[recipients.emails[user_id]] = None
     await delete_subscriptions(db, expired)
+    if not available["email"]:
+        logger.info(
+            "[notifications] organiser %s email skipped (no email channel): %d owner(s)",
+            decision,
+            len(owners),
+        )
     rendered = render_email(message, app_url())
     ok = await send_emails([(to, rendered) for to in emails])
     logger.info(
