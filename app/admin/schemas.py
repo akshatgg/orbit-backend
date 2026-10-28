@@ -175,7 +175,12 @@ class ReasonBody(BaseModel):
 
 class BulkRemoveBody(BaseModel):
     ids: list[UUID] = Field(min_length=1, max_length=500)
-    reason: str = Field(min_length=1, max_length=500)
+    reason: str | None = Field(default=None, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason(cls, value: str | None) -> str | None:
+        return (value or "").strip() or None
 
 
 class BulkCategoryBody(BaseModel):
