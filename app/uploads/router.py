@@ -1,8 +1,8 @@
-"""Upload routes."""
+"""Upload routes. Images go straight from the browser to Cloudinary."""
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 
 from app.core.config import settings
@@ -17,20 +17,15 @@ class SignIn(BaseModel):
 
 
 @router.post("/sign")
-async def sign_upload(body: SignIn, user: dict = Depends(require_user)) -> dict:
-    """Cloudinary upload signature; 503 when Cloudinary is not configured."""
+async def sign_upload(
+    body: SignIn, response: Response, user: dict = Depends(require_user)
+) -> dict:
+    """Cloudinary upload signature for the signed-in user; 503 when Cloudinary
+    is not configured. The API secret never leaves the server."""
     if not settings.cloudinary_configured:
         raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE, "Cloudinary is not configured"
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Image uploads are not configured (Cloudinary keys missing)",
         )
-    return service.sign(body.kind)
-
-
-@router.post("")
-async def upload_image(
-    file: UploadFile = File(...),
-    kind: str = Form(...),
-    user: dict = Depends(require_user),
-) -> dict:
-    """Store an image and return its /uploads/... URL (mounted in app/main.py)."""
-    return await service.save(file, kind, user["id"])
+    response.headers["Cache-Control"] = "no-store"
+    return service.sign(body.kind, user["id"])
