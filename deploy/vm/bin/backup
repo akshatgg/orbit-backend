@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Nightly logical backup of the orbit database, kept OFF the VM.
+# Run by markai-orbit-backup.timer. Restore with:
+#   pg_restore --clean --if-exists -d <url> orbit-<stamp>.dump
+set -euo pipefail
+export PATH="/snap/bin:$PATH"
+
+BUCKET=gs://markai-cms-db-backups/orbit-nightly
+DIR=/var/lib/markai-orbit/backup
+FILE="$DIR/orbit-$(date -u +%Y%m%dT%H%M%SZ).dump"
+
+mkdir -p "$DIR"
+trap 'rm -f "$FILE"' EXIT
+# </dev/null: `docker exec` otherwise swallows the rest of a piped script.
+docker exec markai-orbit sh -c \
+  'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -h 127.0.0.1 -U "${POSTGRES_USER:-orbit}" -d "${POSTGRES_DB:-orbit}" -Fc' \
+  > "$FILE" </dev/null
+gcloud storage cp --quiet "$FILE" "$BUCKET/" --project markai-499512
+echo "[backup] uploaded $(basename "$FILE") ($(stat -c %s "$FILE") bytes)"

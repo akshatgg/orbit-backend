@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# bin/deploy <image>
+#   pull the image, render the env, swap the container, wait until healthy.
+# Roll back by running it again with the previous image tag.
+set -euo pipefail
+export PATH="/snap/bin:$PATH"
+
+IMAGE=${1:?usage: deploy <image>}
+ROOT=/opt/markai-orbit
+cd "$ROOT"
+
+# Short-lived token from the VM's service account; no credential helper needed.
+gcloud auth print-access-token \
+  | docker login -u oauth2accesstoken --password-stdin https://us-central1-docker.pkg.dev >/dev/null
+docker pull -q "$IMAGE"
+
+"$ROOT/bin/render-env"
+echo "ORBIT_IMAGE=$IMAGE" > "$ROOT/.env"
+docker compose up -d --remove-orphans
+
+status=none
+for _ in $(seq 1 90); do
+  status=$(docker inspect -f '{{.State.Health.Status}}' markai-orbit 2>/dev/null || echo none)
+  [ "$status" = healthy ] && break
+  [ "$status" = unhealthy ] && break
+  sleep 5
+done
+if [ "$status" != healthy ]; then
+  echo "[deploy] markai-orbit is $status" >&2
+  docker logs --tail 60 markai-orbit >&2 || true
+  exit 1
+fi
+
+docker image prune -f >/dev/null
+echo "[deploy] healthy: $IMAGE"

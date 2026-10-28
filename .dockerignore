@@ -1,0 +1,18 @@
+# Build context hygiene. Without this, `.env` (real secrets) and .venv end up
+# inside the image — one is a leak, the other is ~200 MB of wasted layers.
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.git/
+.gitignore
+.DS_Store
+var/
+*.log
+seeds/storage/
