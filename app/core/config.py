@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_HOURS: int = 720  # 30 days — students open Orbit between lectures
     SESSION_COOKIE: str = "orbit_session"
+    # Parent domain for the session cookie (e.g. ".example.com") so the frontend's
+    # host receives the cookie the API host sets. Blank = host-only (localhost).
+    SESSION_COOKIE_DOMAIN: Optional[str] = None
     FRONTEND_URL: str = "http://localhost:3000"
     BACKEND_URL: str = "http://localhost:8090"
     # Founder/ops account promoted on signup, matching Orbit's super_admin_email().

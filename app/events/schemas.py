@@ -74,6 +74,13 @@ class EventCard(BaseModel):
     counts: EventCounts = Field(default_factory=EventCounts)
 
 
+class EventCountsRow(BaseModel):
+    event_id: UUID
+    going: int = 0
+    waitlisted: int = 0
+    pending: int = 0
+
+
 class EventPage(BaseModel):
     items: list[EventCard]
     total: int
@@ -144,7 +151,7 @@ class EventPrivateOut(BaseModel):
 
 class EventDetail(EventCard):
     description: str | None = None
-    ticket_types: list[TicketTypeOut] = Field(default_factory=list)
+    ticket_types: list[TicketTypeAvailability] = Field(default_factory=list)
     event_questions: list[EventQuestionOut] = Field(default_factory=list)
     spots_left: int | None = None
     can_manage: bool = False
