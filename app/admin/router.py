@@ -1085,6 +1085,9 @@ async def admin_update_category(
             raise HTTPException(
                 http_status.HTTP_422_UNPROCESSABLE_ENTITY, f"{required} cannot be empty"
             )
+    if "group" in values:
+        # "group" is reserved in SQL, so the mapped attribute is `group_name`.
+        values["group_name"] = values.pop("group")
     if values:
         try:
             await db.execute(
