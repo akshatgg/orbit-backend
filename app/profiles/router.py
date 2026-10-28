@@ -224,17 +224,20 @@ async def my_ticket(
 
 @router.get("/following")
 async def following(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)) -> dict:
-    """Organisers I follow."""
+    """Organisers I follow, newest follow first; ones I could not see (not approved, not mine,
+    not my team's) are left out, as RLS did."""
     rows = (
         await db.execute(
             text(
                 """
-                select o.id, o.name, o.slug, o.logo_url, o.university, o.is_verified,
+                select o.id, o.name, o.slug, o.kind, o.bio, o.logo_url, o.university, o.is_verified,
                        (select count(*) from public.follows f2 where f2.organiser_id = o.id) as followers
                   from public.follows f
                   join public.organisers o on o.id = f.organiser_id
                  where f.user_id = :uid
-                 order by o.name
+                   and (o.status = 'approved' or o.created_by = :uid
+                        or public.is_org_member(o.id) or public.is_admin())
+                 order by f.created_at desc
                 """
             ),
             {"uid": user["id"]},
