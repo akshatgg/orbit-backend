@@ -432,6 +432,8 @@ EVENT_INPUT_FIELDS = (
     "waitlist_enabled",
     "registration_deadline",
     "cover_url",
+    "price_min",
+    "price_max",
 )
 
 
@@ -472,6 +474,9 @@ async def create_event(db: AsyncSession, data: dict, user_id: UUID | str) -> dic
     questions = data.pop("questions", []) or []
     private = data.pop("private", None)
     values = _event_values(data, partial=False)
+    if values["registration_mode"] == "tickets":
+        # A ticketed event's price range follows its ticket types (the sync_event_price trigger).
+        values["price_min"] = values["price_max"] = None
 
     _require_approved(await _organiser(db, data["organiser_id"]))
 
@@ -482,13 +487,14 @@ async def create_event(db: AsyncSession, data: dict, user_id: UUID | str) -> dic
           (organiser_id, title, summary, description, starts_at, ends_at, timezone, format,
            venue_name, address, city, country, category_id, tags, university, registration_mode,
            external_url, external_label, requires_approval, capacity, waitlist_enabled,
-           registration_deadline, cover_url, status, source, created_by, currency)
+           registration_deadline, cover_url, price_min, price_max, status, source, created_by,
+           currency)
         values
           (:organiser_id, :title, :summary, :description, :starts_at, :ends_at, :timezone, :format,
            :venue_name, :address, :city, :country, :category_id, :tags, :university,
            :registration_mode, :external_url, :external_label, :requires_approval, :capacity,
-           :waitlist_enabled, :registration_deadline, :cover_url, 'draft', 'orbit', :created_by,
-           :currency)
+           :waitlist_enabled, :registration_deadline, :cover_url, :price_min, :price_max, 'draft',
+           'orbit', :created_by, :currency)
         returning {EVENT_COLUMNS}
         """,
         {
@@ -540,6 +546,10 @@ async def update_event(db: AsyncSession, event_id: UUID | str, data: dict) -> di
     _require_approved(org)
 
     mode = values.get("registration_mode") or event["registration_mode"]
+    if mode == "tickets":
+        # The ticket types decide a ticketed event's price range (sync_event_price).
+        values.pop("price_min", None)
+        values.pop("price_max", None)
     if (
         event["registration_mode"] == "tickets"
         and mode != "tickets"

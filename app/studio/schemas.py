@@ -28,6 +28,11 @@ def _aware(value: datetime | None) -> datetime | None:
     return value
 
 
+def _prices_ordered(low: Decimal | None, high: Decimal | None) -> None:
+    if low is not None and high is not None and high < low:
+        raise ValueError("price_max cannot be below price_min")
+
+
 class TicketTypeIn(BaseModel):
     """A ticket type. On edit, an `id` keeps that row (and its guests); no id adds one."""
 
@@ -96,6 +101,10 @@ class EventCreate(BaseModel):
     waitlist_enabled: bool = True
     registration_deadline: datetime | None = None
     cover_url: str | None = Field(default=None, max_length=500, pattern=URL_PATTERN)
+    # The shown price of an external or info-only event (a ticketed event's comes from its
+    # ticket types, so these are ignored there).
+    price_min: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+    price_max: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
     ticket_types: list[TicketTypeIn] = Field(default_factory=list)
     questions: list[QuestionIn] = Field(default_factory=list)
     private: EventPrivateIn | None = None
@@ -111,6 +120,7 @@ class EventCreate(BaseModel):
             raise ValueError("ends_at cannot be before starts_at")
         if self.registration_mode == "external" and not self.external_url:
             raise ValueError("external events need an external_url")
+        _prices_ordered(self.price_min, self.price_max)
         return self
 
 
@@ -141,6 +151,10 @@ class EventUpdate(BaseModel):
     waitlist_enabled: bool | None = None
     registration_deadline: datetime | None = None
     cover_url: str | None = Field(default=None, max_length=500, pattern=URL_PATTERN)
+    # The shown price of an external or info-only event (a ticketed event's comes from its
+    # ticket types, so these are ignored there).
+    price_min: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+    price_max: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
     ticket_types: list[TicketTypeIn] | None = None
     questions: list[QuestionIn] | None = None
     private: EventPrivateIn | None = None
@@ -154,6 +168,7 @@ class EventUpdate(BaseModel):
     def _ordered(self) -> "EventUpdate":
         if self.ends_at and self.starts_at and self.ends_at < self.starts_at:
             raise ValueError("ends_at cannot be before starts_at")
+        _prices_ordered(self.price_min, self.price_max)
         for rows in (self.ticket_types, self.questions):
             ids = [row.id for row in rows or [] if row.id is not None]
             if len(ids) != len(set(ids)):
