@@ -102,6 +102,105 @@ async def my_calendar(
     return await _marked_cards(db, user_id, stmt.order_by(Event.starts_at).limit(CALENDAR_LIMIT))
 
 
+# A registration with its event and ticket type (the frontend's TICKET_SELECT). Only events the
+# person could open (public, or their team's) are listed, as RLS did.
+_TICKET_SQL = f"""
+    select r.*,
+           e.title, e.summary, e.starts_at, e.ends_at, e.timezone, e.format, e.venue_name,
+           e.address, e.city, e.cover_url, e.external_url, e.status as event_status,
+           e.cancel_reason, e.registration_mode,
+           o.id as org_id, o.slug as org_slug, o.name as org_name, o.logo_url as org_logo_url,
+           o.is_verified as org_is_verified,
+           t.name as ticket_type, t.price as ticket_price, t.currency as ticket_currency,
+           p.online_url, p.guest_info
+      from public.registrations r
+      join public.events e on e.id = r.event_id
+      left join public.organisers o on o.id = e.organiser_id
+      left join public.ticket_types t on t.id = r.ticket_type_id
+      left join public.event_private p on p.event_id = e.id
+     where r.user_id = :uid
+       and ({events.PUBLICLY_VISIBLE_SQL} or public.can_manage_event(e.id))
+"""
+# The flat fields a ticket row always had; the single ticket also keeps the rest of its
+# registration row, as before.
+_TICKET_FIELDS = (
+    "id", "status", "payment_status", "amount", "currency", "qr_code", "checked_in_at", "created_at",
+    "answers", "ticket_type_id", "event_id", "title", "starts_at", "ends_at", "timezone", "venue_name",
+    "address", "city", "cover_url", "external_url", "ticket_type",
+)
+_TICKET_DETAIL_FIELDS = (
+    "user_id", "stripe_checkout_session_id", "stripe_payment_intent_id", "checked_in_by",
+    "decided_at", "updated_at",
+)
+
+
+def _ticket(row: Any, *, detail: bool) -> dict:
+    """One ticket: the flat fields plus `ticket` and `event` (with its organiser) nested, as the
+    frontend's TicketRow had them."""
+    out = {key: row[key] for key in _TICKET_FIELDS + (_TICKET_DETAIL_FIELDS if detail else ())}
+    out["ticket"] = (
+        {
+            "id": row["ticket_type_id"],
+            "name": row["ticket_type"],
+            "price": row["ticket_price"],
+            "currency": row["ticket_currency"],
+        }
+        if row["ticket_type"] is not None
+        else None
+    )
+    out["event"] = {
+        "id": row["event_id"],
+        "title": row["title"],
+        "summary": row["summary"],
+        "cover_url": row["cover_url"],
+        "starts_at": row["starts_at"],
+        "ends_at": row["ends_at"],
+        "format": row["format"],
+        "venue_name": row["venue_name"],
+        "address": row["address"],
+        "city": row["city"],
+        "status": row["event_status"],
+        "cancel_reason": row["cancel_reason"],
+        "registration_mode": row["registration_mode"],
+        "organiser": (
+            {
+                "id": row["org_id"],
+                "slug": row["org_slug"],
+                "name": row["org_name"],
+                "logo_url": row["org_logo_url"],
+                "is_verified": row["org_is_verified"],
+            }
+            if row["org_id"] is not None
+            else None
+        ),
+    }
+    if detail:
+        # The private guest details are for confirmed guests only.
+        going = row["status"] == "going"
+        out["online_url"] = row["online_url"] if going else None
+        out["guest_info"] = row["guest_info"] if going else None
+    return out
+
+
+async def my_tickets(db: AsyncSession, user_id: UUID, tab: str) -> list[dict]:
+    """`upcoming`: not ended yet (so a started event is still here), soonest first;
+    `past`: ended, latest first. Every registration status is included."""
+    ended = "coalesce(e.ends_at, e.starts_at) < now()"
+    where = f"not ({ended})" if tab == "upcoming" else ended
+    order = "e.starts_at asc" if tab == "upcoming" else "e.starts_at desc"
+    rows = (
+        await db.execute(text(f"{_TICKET_SQL} and {where} order by {order}, r.created_at"), {"uid": user_id})
+    ).mappings().all()
+    return [_ticket(row, detail=False) for row in rows]
+
+
+async def my_ticket(db: AsyncSession, user_id: UUID, registration_id: UUID) -> dict | None:
+    row = (
+        await db.execute(text(f"{_TICKET_SQL} and r.id = :id"), {"uid": user_id, "id": registration_id})
+    ).mappings().first()
+    return _ticket(row, detail=True) if row else None
+
+
 async def known_categories(db: AsyncSession, slugs: list[str]) -> list[str]:
     """`slugs` without the ones that are not categories, order kept (keepKnownCategories)."""
     if not slugs:

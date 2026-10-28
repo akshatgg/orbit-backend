@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response
@@ -203,59 +204,22 @@ async def my_tickets(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """My registrations with the event and ticket type."""
-    op = ">=" if tab == "upcoming" else "<"
-    rows = (
-        await db.execute(
-            text(
-                """
-                select r.id, r.status, r.payment_status, r.amount, r.currency, r.qr_code,
-                       r.checked_in_at, r.created_at, r.answers,
-                       e.id as event_id, e.title, e.starts_at, e.ends_at, e.timezone,
-                       e.venue_name, e.address, e.city, e.cover_url, e.external_url,
-                       t.name as ticket_type
-                  from public.registrations r
-                  join public.events e on e.id = r.event_id
-                  left join public.ticket_types t on t.id = r.ticket_type_id
-                 where r.user_id = :uid and e.starts_at {} now()
-                 order by e.starts_at {}
-                """.format(op, "asc" if tab == "upcoming" else "desc")
-            ),
-            {"uid": user["id"]},
-        )
-    ).mappings().all()
-    return {"items": [dict(r) for r in rows], "total": len(rows), "tab": tab}
+    """My registrations with their event (and its organiser) and ticket type."""
+    items = await service.my_tickets(db, user["id"], tab)
+    return {"items": items, "total": len(items), "tab": tab}
 
 
 @router.get("/tickets/{registration_id}")
 async def my_ticket(
-    registration_id: str,
+    registration_id: UUID,
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """One ticket, with the private guest details only a guest may see."""
-    row = (
-        await db.execute(
-            text(
-                """
-                select r.*, e.title, e.starts_at, e.ends_at, e.timezone, e.venue_name,
-                       e.address, e.city, e.cover_url, e.external_url,
-                       t.name as ticket_type,
-                       case when r.status = 'going' then p.online_url end as online_url,
-                       case when r.status = 'going' then p.guest_info end as guest_info
-                  from public.registrations r
-                  join public.events e on e.id = r.event_id
-                  left join public.ticket_types t on t.id = r.ticket_type_id
-                  left join public.event_private p on p.event_id = e.id
-                 where r.id = :id and r.user_id = :uid
-                """
-            ),
-            {"id": registration_id, "uid": user["id"]},
-        )
-    ).mappings().first()
+    """One ticket, with the private guest details only a confirmed guest may see."""
+    row = await service.my_ticket(db, user["id"], registration_id)
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Ticket not found")
-    return dict(row)
+    return row
 
 
 @router.get("/following")

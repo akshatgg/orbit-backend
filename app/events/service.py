@@ -319,6 +319,13 @@ async def feed_candidates(
 PUBLIC_STATUSES = ("published", "cancelled", "expired")
 
 
+# The same rule for raw SQL over `events e left join organisers o on o.id = e.organiser_id`.
+PUBLICLY_VISIBLE_SQL = (
+    "(e.status in ('published', 'cancelled', 'expired')"
+    " and (e.organiser_id is null or o.status = 'approved'))"
+)
+
+
 def publicly_visible(event: Event, organiser: Organiser | None) -> bool:
     """Whether anyone, signed in or not, may open this event's page."""
     return event.status in PUBLIC_STATUSES and (
