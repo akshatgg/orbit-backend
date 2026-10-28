@@ -24,6 +24,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.notifications.service import notify_registration_changed
 from app.sql import functions as fn
 
 from . import gateway, logic
@@ -95,13 +96,12 @@ def payments_page_url(organiser_id: UUID | str, extra: str = "") -> str:
 
 
 async def _registration_paid(db: AsyncSession, registration_id: str) -> None:
-    """Hook: a registration just became paid (status going).
+    """Hook: a registration just became paid (status going). Tells the buyer "you're in".
 
-    Notifications (W3) call
-    `app.notifications.service.notify_registration_changed(db, [UUID(registration_id)], reason="paid")`
-    here. It must never raise into the payment hand-off. Until then: no-op.
+    Never raises into the payment hand-off: the notification is queued on this
+    session and sent after it commits (dropped if the payment rolls back).
     """
-    return None
+    await notify_registration_changed(db, [registration_id], reason="paid")
 
 
 # ─── ticket checkout ────────────────────────────────────────────────────────
