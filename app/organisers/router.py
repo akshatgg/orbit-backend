@@ -1,6 +1,6 @@
 """Organiser profiles, public pages, teams, invites and follows."""
 
-from typing import Optional
+from typing import Literal, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -82,11 +82,14 @@ async def update_organiser(
 @organisers_router.get("/{organiser_id}/events")
 async def organiser_events(
     organiser_id: UUID,
+    when: Literal["upcoming", "past", "all"] = Query("upcoming"),
     pg: tuple[int, int] = Depends(pagination),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """An organiser's published, upcoming events with guest counts."""
-    return await service.public_events_page(db, organiser_id, *pg)
+    """An organiser's public events with guest counts. `upcoming` (default) is
+    published events still to come; `past` and `all` also show cancelled and
+    expired ones. Drafts are never listed."""
+    return await service.public_events_page(db, organiser_id, *pg, when=when)
 
 
 @organisers_router.put("/{organiser_id}/follow")

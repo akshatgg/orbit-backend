@@ -29,8 +29,11 @@ def _aware(value: datetime | None) -> datetime | None:
 
 
 class TicketTypeIn(BaseModel):
+    """A ticket type. On edit, an `id` keeps that row (and its guests); no id adds one."""
+
     model_config = ConfigDict(extra="forbid")
 
+    id: UUID | None = None
     name: str = Field(min_length=1, max_length=60)
     description: str | None = None
     price: Decimal = Field(default=Decimal("0"), ge=0, max_digits=10, decimal_places=2)
@@ -46,8 +49,11 @@ class TicketTypeIn(BaseModel):
 
 
 class QuestionIn(BaseModel):
+    """An application question. On edit, an `id` keeps that row (and its answers)."""
+
     model_config = ConfigDict(extra="forbid")
 
+    id: UUID | None = None
     label: str = Field(min_length=1, max_length=200)
     kind: QuestionKind = "short_text"
     options: list[str] = Field(default_factory=list)
@@ -148,6 +154,47 @@ class EventUpdate(BaseModel):
     def _ordered(self) -> "EventUpdate":
         if self.ends_at and self.starts_at and self.ends_at < self.starts_at:
             raise ValueError("ends_at cannot be before starts_at")
+        for rows in (self.ticket_types, self.questions):
+            ids = [row.id for row in rows or [] if row.id is not None]
+            if len(ids) != len(set(ids)):
+                raise ValueError("the same id appears twice")
+        return self
+
+
+# The editor's MAX_EXTRA_DATES: the first date plus up to 25 more in one go.
+MAX_EXTRA_DATES = 25
+
+
+class DateSlotIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    starts_at: datetime
+    ends_at: datetime | None = None
+
+    @field_validator("starts_at", "ends_at")
+    @classmethod
+    def _tz(cls, value: datetime | None) -> datetime | None:
+        return _aware(value)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "DateSlotIn":
+        if self.ends_at and self.ends_at <= self.starts_at:
+            raise ValueError("each date must end after it starts")
+        return self
+
+
+class DatesIn(BaseModel):
+    """More dates for an event: each becomes its own event in the same series."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dates: list[DateSlotIn] = Field(min_length=1, max_length=MAX_EXTRA_DATES)
+
+    @model_validator(mode="after")
+    def _distinct(self) -> "DatesIn":
+        starts = [slot.starts_at for slot in self.dates]
+        if len(starts) != len(set(starts)):
+            raise ValueError("the same date appears twice")
         return self
 
 
