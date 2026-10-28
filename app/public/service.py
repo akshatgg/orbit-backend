@@ -45,15 +45,19 @@ async def og_event(db: AsyncSession, event_id: UUID) -> dict | None:
     if not row:
         return None
     event, organiser, _ = row
-    if event.status != "published" or event.duplicate_of is not None:
+    # getEventForOg: published or cancelled (a cancelled event's card says so), as a visitor sees it.
+    if event.status not in ("published", "cancelled") or not events.publicly_visible(event, organiser):
         return None
     summary = event.summary or (event.description or "").strip()[:200] or None
     return {
+        "id": event.id,
         "title": event.title,
         "summary": summary,
         "cover_url": event.cover_url,
         "starts_at": event.starts_at,
         "venue_name": event.venue_name,
         "city": event.city,
+        "format": event.format,
+        "status": event.status,
         "organiser_name": organiser.name if organiser else None,
     }
