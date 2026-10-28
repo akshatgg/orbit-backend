@@ -26,6 +26,8 @@ from app.sources.schemas import (
     SourceCreate,
     SourceUpdate,
 )
+from app.connectors.platforms import DEFAULT_ATTRIBUTION, resolve_feed_url
+from app.sources.cloudinary import import_remote_image
 from app.sources.service import (
     detect_duplicates_now,
     run_source,
@@ -37,6 +39,9 @@ from app.sources.service import (
 router = APIRouter(prefix="/admin/sources", tags=["admin:sources"])
 
 SOURCE_LABELS = {"orbit": "ORBIT (organiser)", "csv": "CSV import"}
+IMPORTED_KINDS = {"luma", "luma-discover", "meetup", "meetup-search", "eventbrite", "fatsoma"}
+# Kinds whose feed doesn't own the description, so an admin's one survives every sync.
+EDITABLE_DESCRIPTION = {"luma", "luma-discover", "eventbrite"}
 
 
 def _now() -> datetime:
@@ -142,6 +147,14 @@ async def _latest_runs(db: AsyncSession, source_ids: list[UUID]) -> dict[str, So
         )
     ).scalars().all()
     return {str(run.source_id): run for run in rows}
+
+
+def _resolved_url(kind: str, url: str) -> str:
+    """The feed URL Orbit fetches for what an admin pasted (resolveFeedUrl), or 422 saying why not."""
+    resolved = resolve_feed_url(kind, url)
+    if not resolved.ok:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, resolved.error)
+    return resolved.url
 
 
 def _validate_enabling(enabled: Any, confirmed: Any, note: Any) -> None:
@@ -582,11 +595,32 @@ async def update_imported(
     ).scalar_one_or_none()
     if event is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "That event no longer exists.")
-    if not event.source.startswith("source:"):
+    source_id = source_id_from_key(event.source)
+    kind = await db.scalar(select(EventSource.kind).where(EventSource.id == source_id)) if source_id else None
+    if kind not in IMPORTED_KINDS:
         raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, "Only imported platform events can be edited here."
+            status.HTTP_400_BAD_REQUEST,
+            "Only events imported from Luma, Meetup, Eventbrite or Fatsoma can be edited here.",
         )
     values = body.model_dump(exclude_unset=True)
+    image_url = (values.pop("image_url", None) or "").strip()
+    if image_url:
+        try:
+            values["cover_url"] = await import_remote_image(image_url, f"orbit/event-covers/{admin['id']}")
+        except Exception as exc:  # noqa: BLE001 - shown to the admin
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc) or "Couldn't import that image.")
+    # Meetup and Fatsoma descriptions belong to the feed, so only the others take one here.
+    if kind not in EDITABLE_DESCRIPTION:
+        values.pop("description", None)
+    # Only a changed price is (re)stored in GBP; unrelated saves leave the stored currency alone.
+    if "price_min" in values or "price_max" in values:
+        new_min = values.get("price_min", event.price_min)
+        new_max = values.get("price_max", event.price_max)
+        if new_min == event.price_min and new_max == event.price_max:
+            values.pop("price_min", None)
+            values.pop("price_max", None)
+        elif new_min is not None and "currency" not in values:
+            values["currency"] = "GBP"
     if not values:
         return {"ok": True, "event": _event_summary(event, await _source_names(db))}
     values["updated_at"] = _now()
@@ -646,6 +680,8 @@ async def create_source(
 ) -> dict[str, Any]:
     """Add a feed, refusing to enable one whose permission isn't confirmed."""
     values = body.model_dump()
+    values["url"] = _resolved_url(values["kind"], values["url"])
+    values["attribution"] = values.get("attribution") or DEFAULT_ATTRIBUTION.get(values["kind"])
     _validate_enabling(values.get("enabled"), values.get("permission_confirmed"), values.get("permission_note"))
     values["created_by"] = admin["id"]
     try:
@@ -703,6 +739,10 @@ async def update_source(
     if "default_tags" in values and values["default_tags"] is None:
         values["default_tags"] = []
     merged = {**_source_dict(source), **values}
+    if "url" in values or "kind" in values:
+        values["url"] = merged["url"] = _resolved_url(merged["kind"], merged["url"])
+    if "attribution" in values and not values["attribution"]:
+        values["attribution"] = DEFAULT_ATTRIBUTION.get(merged["kind"])
     _validate_enabling(
         merged.get("enabled"), merged.get("permission_confirmed"), merged.get("permission_note")
     )

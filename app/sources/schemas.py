@@ -33,10 +33,9 @@ class SourceCreate(BaseModel):
     @field_validator("url")
     @classmethod
     def _http_url(cls, value: str) -> str:
-        value = value.strip()
-        if not value.lower().startswith(("http://", "https://")):
-            raise ValueError("The URL must start with http:// or https://")
-        return value
+        # The router resolves it per kind (resolve_feed_url), which also accepts "meetup.com/x"
+        # and webcal:// links, as the TypeScript admin did.
+        return value.strip()
 
     @field_validator("default_tags")
     @classmethod
@@ -65,12 +64,7 @@ class SourceUpdate(BaseModel):
     @field_validator("url")
     @classmethod
     def _http_url(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = value.strip()
-        if not value.lower().startswith(("http://", "https://")):
-            raise ValueError("The URL must start with http:// or https://")
-        return value
+        return value.strip() if value is not None else None
 
     @field_validator("default_tags")
     @classmethod
@@ -98,6 +92,8 @@ class BulkReviewBody(BaseModel):
 
 
 class ImportedDetailsBody(BaseModel):
+    # A pasted image link: Cloudinary imports it and the copy becomes the cover.
+    image_url: str | None = Field(default=None, max_length=2000)
     cover_url: str | None = None
     description: str | None = Field(default=None, max_length=10000)
     price_min: Decimal | None = Field(default=None, ge=0)
