@@ -1,5 +1,6 @@
 """Notification preferences and push subscriptions for the signed-in user."""
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -10,16 +11,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.deps import require_user
+from app.notifications.channels import (
+    StoredSubscription,
+    delete_subscriptions,
+    push_available,
+    send_push,
+)
+from app.notifications.messages import push_test_message
 from app.notifications.models import NotificationPreference, PushSubscription
 from app.notifications.schemas import (
     EndpointBody,
     NotificationPreferencesUpdate,
     PushSubscriptionBody,
 )
-from app.notifications.service import DEFAULT_PREFERENCES, send_email
+from app.notifications.service import DEFAULT_PREFERENCES
 from app.sql import functions as fn
 
 router = APIRouter(tags=["notifications"])
+logger = logging.getLogger(__name__)
 
 
 def _preferences(prefs: NotificationPreference | None, user_id: Any) -> dict[str, Any]:
@@ -88,10 +97,21 @@ async def save_push_subscription(
     db: AsyncSession = Depends(get_db),
     user: dict = Depends(require_user),
 ) -> dict[str, Any]:
-    """Store this browser's push subscription for the frontend service worker."""
+    """Store this browser's push subscription.
+
+    `old_endpoint` is the subscription it replaces when the browser rotates one
+    (the service worker's pushsubscriptionchange); it is removed.
+    """
     subscription_id = await fn.save_push_subscription(
         db, body.endpoint, body.keys.p256dh, body.keys.auth, body.user_agent
     )
+    if body.old_endpoint and body.old_endpoint != body.endpoint:
+        await db.execute(
+            delete(PushSubscription).where(
+                PushSubscription.user_id == user["id"],
+                PushSubscription.endpoint == body.old_endpoint,
+            )
+        )
     return {"id": subscription_id}
 
 
@@ -113,16 +133,31 @@ async def delete_push_subscription(
 
 @router.post("/push/test")
 async def push_test(
+    db: AsyncSession = Depends(get_db),
     user: dict = Depends(require_user),
-) -> dict[str, int]:
-    """Email the caller a test message; push subscriptions are stored for the service worker, delivery isn't implemented yet."""
-    to = user.get("email")
-    if not to:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Your account has no email address")
-    html = (
-        "<p>This is a test from Orbit.</p>"
-        "<p>Your notification settings are working. Push delivery will arrive through "
-        "your browser's service worker.</p>"
+) -> dict[str, Any]:
+    """Send a test push to every device of the caller.
+
+    503 push_not_configured · 400 no_push_subscriptions · 502 push_unreachable
+    (nothing delivered; devices the push service says are gone are removed).
+    """
+    if not push_available():
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "push_not_configured")
+    rows = (
+        await db.execute(
+            select(PushSubscription).where(PushSubscription.user_id == user["id"])
+        )
+    ).scalars().all()
+    if not rows:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "no_push_subscriptions")
+    result = await send_push(
+        [StoredSubscription(r.endpoint, r.p256dh, r.auth) for r in rows], push_test_message()
     )
-    sent = 1 if await send_email(to, "Orbit test notification", html) else 0
-    return {"sent": sent}
+    await delete_subscriptions(db, result.expired_endpoints)
+    counts = {"delivered": result.delivered, "failed": result.failed, "expired": result.expired}
+    logger.info("[push/test] %s %s", user["id"], counts)
+    if result.delivered == 0:
+        # Commit the removal of expired devices before answering with an error.
+        await db.commit()
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "push_unreachable")
+    return {"ok": True, **counts}

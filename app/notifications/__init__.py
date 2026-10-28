@@ -1,5 +1,15 @@
-"""Notification preferences, push subscriptions and the email sender."""
+"""Notifications: push and email for registration, event and organiser changes, and reminders."""
 
-from .service import notify_event_change, send_email
+from .service import (
+    notify_event_changed,
+    notify_organiser_decision,
+    notify_registration_changed,
+    send_email,
+)
 
-__all__ = ["send_email", "notify_event_change"]
+__all__ = [
+    "notify_event_changed",
+    "notify_organiser_decision",
+    "notify_registration_changed",
+    "send_email",
+]
