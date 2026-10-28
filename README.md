@@ -112,6 +112,52 @@ Both are `GET` and need `Authorization: Bearer $CRON_SECRET`.
 `POST /api/cron/refresh-sources` is the admin "refresh now" button (needs an
 admin token), not a cron target.
 
+## Importing production data
+
+`scripts/migrate_prod_data.py` moves a live Orbit database into another
+Postgres (local, Cloud SQL, Neon, your own cluster). It reads the source in a
+read-only session and rebuilds the target.
+
+```bash
+# 1. schema first
+TARGET_DATABASE_URL=postgresql://orbit:orbit@localhost:5433/orbit \
+  .venv/bin/alembic upgrade head
+
+# 2. data
+PROD_DATABASE_URL=postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres \
+TARGET_DATABASE_URL=postgresql://orbit:orbit@localhost:5433/orbit \
+  .venv/bin/python scripts/migrate_prod_data.py --truncate
+
+# 3. verify only (no writes)
+... .venv/bin/python scripts/migrate_prod_data.py --verify-only
+```
+
+What it does:
+
+- copies **auth.users → public.users** (id, email, verified timestamp), so
+  profiles, registrations and marks keep pointing at the same people;
+- copies every `public` table with `COPY`, skipping generated columns
+  (`events.search` is rebuilt by Postgres);
+- runs the load with `session_replication_role = replica`, so table order
+  cannot break it, then checks for orphans;
+- advances identity sequences (`event_interactions`, `notification_log`) past
+  the copied ids;
+- compares row counts table by table and exits non-zero on any difference.
+
+Tested against production on 2026-10-28: 3,879 events, 12 users, 22 tables —
+every count matched, and a second `--truncate` run produced the same result.
+
+Two things it deliberately does not carry over:
+
+- **Password hashes.** Supabase stores bcrypt in `auth.users.encrypted_password`;
+  this schema stores hex. Migrated users sign in with a magic link (or Google,
+  which matches the existing row by email) and set a password afterwards.
+- **Storage objects.** Orbit's images are Cloudinary URLs; the one file in
+  Supabase Storage is not copied.
+
+`session_replication_role` needs a superuser or the database owner. On Cloud SQL
+run the import as the instance owner, not the application user.
+
 ## Status
 
 - Schema: verified identical to Orbit's Supabase database (0 differences).
