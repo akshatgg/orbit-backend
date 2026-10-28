@@ -1,8 +1,0 @@
-[Unit]
-Description=markai-orbit nightly pg_dump to GCS
-After=docker.service
-Requires=docker.service
-
-[Service]
-Type=oneshot
-ExecStart=/opt/markai-orbit/bin/backup

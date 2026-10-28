@@ -10,6 +10,5 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 mkdir -p /opt/markai-orbit /etc/markai-orbit \
-         /var/lib/markai-orbit/pgdata /var/lib/markai-orbit/uploads \
-         /var/lib/markai-orbit/caddy /var/lib/markai-orbit/backup
+         /var/lib/markai-orbit/pgdata /var/lib/markai-orbit/caddy
 chmod 700 /etc/markai-orbit

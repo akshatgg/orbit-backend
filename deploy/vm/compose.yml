@@ -14,8 +14,6 @@ services:
     volumes:
       # The database. Without this mount every row is lost on the next deploy.
       - /var/lib/markai-orbit/pgdata:/var/lib/postgresql/data
-      # Local upload fallback (used while Cloudinary is not configured).
-      - /var/lib/markai-orbit/uploads:/app/var/uploads
     # Docker's 64 MB default /dev/shm is too small for Postgres parallel queries.
     shm_size: 256m
     # Measured peak under load: ~300 MiB for Postgres + API together.

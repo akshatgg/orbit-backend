@@ -18,13 +18,11 @@ step "service account $SA"
 gcloud iam service-accounts describe "$SA" "${G[@]}" >/dev/null 2>&1 \
   || gcloud iam service-accounts create "$NAME-runtime" "${G[@]}" --display-name "markai-orbit VM runtime"
 
-step "roles: log writer, image reader, backup uploader"
+step "roles: log writer, image reader"
 gcloud projects add-iam-policy-binding "$PROJECT" --quiet --condition=None --format=none \
   --member "serviceAccount:$SA" --role roles/logging.logWriter
 gcloud artifacts repositories add-iam-policy-binding markai "${G[@]}" --location "$REGION" --format=none \
   --member "serviceAccount:$SA" --role roles/artifactregistry.reader
-gcloud storage buckets add-iam-policy-binding gs://markai-cms-db-backups --format=none \
-  --member "serviceAccount:$SA" --role roles/storage.objectCreator
 
 step "secrets MARKAI_ORBIT_{JWT_SECRET,CRON_SECRET,POSTGRES_PASSWORD}"
 for s in JWT_SECRET CRON_SECRET POSTGRES_PASSWORD; do
