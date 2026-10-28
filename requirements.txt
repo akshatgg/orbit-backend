@@ -22,3 +22,4 @@ email-validator>=2.2
 icalendar>=6.1
 python-dateutil>=2.9
 stripe>=11.4
+pywebpush>=2.0

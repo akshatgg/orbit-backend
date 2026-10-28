@@ -18,7 +18,10 @@ async def reminders(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(require_cron)
 ) -> dict[str, int]:
-    """Send event and registration-deadline reminders, deduped through notification_log."""
+    """Event and registration-deadline reminders by push and email, deduped through notification_log.
+
+    Each person's remind_before_hours (2 or 24) sets how far ahead their reminder goes.
+    """
     return await run_reminders(db)
 
 

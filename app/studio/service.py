@@ -22,6 +22,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.pagination import offset
+from app.notifications.service import (
+    logistics_changed,
+    notify_event_changed,
+    notify_registration_changed,
+)
 from app.organisers.service import EVENT_COLUMNS, with_counts
 from app.sql import functions as fn
 from app.uploads.release import release_images
@@ -529,6 +534,7 @@ async def update_event(db: AsyncSession, event_id: UUID | str, data: dict) -> di
     }
 
     event = await _event(db, event_id)
+    before = dict(event)
     _require_editable(event)
     org = await _organiser(db, event["organiser_id"])
     _require_approved(org)
@@ -593,6 +599,9 @@ async def update_event(db: AsyncSession, event_id: UUID | str, data: dict) -> di
         )
     if private_provided:
         await _save_private(db, event["id"], private or {})
+    # Tell guests when a live event's time or place moved (saveEvent step 5).
+    if before["status"] == "published" and logistics_changed(before, event):
+        await notify_event_changed(db, event["id"], "updated")
     return await _with_child_ids(db, event["id"], ticket_ids, question_ids)
 
 
@@ -632,6 +641,7 @@ async def cancel_event(db: AsyncSession, event_id: UUID | str, reason: str) -> d
     if not row:
         await _event(db, event_id)  # 404 when it does not exist
         raise HTTPException(status.HTTP_409_CONFLICT, "event_not_published")
+    await notify_event_changed(db, row["id"], "cancelled")
     return row
 
 
@@ -855,6 +865,7 @@ async def decide(
     db: AsyncSession, event_id: UUID | str, registration_id: UUID | str, decision: str
 ) -> dict:
     await _registration_in_event(db, event_id, registration_id)
+    before = await _waitlisted(db, event_id) if decision == "decline" else set()
     try:
         row = await fn.decide_registration(db, registration_id, decision)
     except DBAPIError as exc:
@@ -862,7 +873,23 @@ async def decide(
         raise _decision_refusal(exc) from exc
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Registration not found")
+    await notify_registration_changed(db, [registration_id], reason="decision")
+    # A decline frees a spot and the database moves people off the waitlist: tell them too.
+    if before:
+        promoted = before - await _waitlisted(db, event_id)
+        await notify_registration_changed(db, list(promoted), reason="waitlist")
     return row
+
+
+async def _waitlisted(db: AsyncSession, event_id: UUID | str) -> set[UUID]:
+    return {
+        row["id"]
+        for row in await _all(
+            db,
+            "select id from registrations where event_id = :e and status = 'waitlisted'",
+            {"e": event_id},
+        )
+    }
 
 
 async def approve_all(db: AsyncSession, event_id: UUID | str) -> dict:
@@ -880,7 +907,7 @@ async def approve_all(db: AsyncSession, event_id: UUID | str) -> dict:
             {"e": event_id},
         )
     ]
-    approved = 0
+    approved: list[UUID] = []
     error: Optional[str] = None
     for registration_id in ids:
         try:
@@ -890,8 +917,9 @@ async def approve_all(db: AsyncSession, event_id: UUID | str) -> dict:
             error = _decision_refusal(exc).detail
             break
         if row:
-            approved += 1
-    return {"ok": error is None, "approved": approved, "total": len(ids), "error": error}
+            approved.append(registration_id)
+    await notify_registration_changed(db, approved, reason="approve_all")
+    return {"ok": error is None, "approved": len(approved), "total": len(ids), "error": error}
 
 
 async def check_in(db: AsyncSession, event_id: UUID | str, code: str) -> dict:
