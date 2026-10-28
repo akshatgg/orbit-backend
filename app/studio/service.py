@@ -642,174 +642,6 @@ async def delete_event(db: AsyncSession, event_id: UUID | str) -> None:
     await db.execute(text("delete from events where id = :id"), {"id": event_id})
 
 
-# ─── more dates (a series) ──────────────────────────────────────────────────
-
-# Editor columns a new date copies from the event it was added to (formToEventRow).
-DATE_COPY_COLUMNS = (
-    "organiser_id, title, summary, description, cover_url, timezone, format, venue_name,"
-    " address, city, country, latitude, longitude, category_id, tags, university,"
-    " registration_mode, external_url, external_label, requires_approval, capacity,"
-    " waitlist_enabled, price_min, price_max, currency"
-)
-
-WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
-MONTHS = (
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-)
-
-
-def _zone(name: Optional[str]) -> ZoneInfo:
-    try:
-        return ZoneInfo(name or settings.DEFAULT_TIMEZONE)
-    except (ZoneInfoNotFoundError, ValueError):
-        return ZoneInfo(settings.DEFAULT_TIMEZONE)
-
-
-def _shift_local_days(
-    value: Optional[datetime], days: int, tz: ZoneInfo
-) -> Optional[datetime]:
-    """The same wall-clock time `days` later in the event's zone (shiftLocalDays)."""
-    if value is None or days == 0:
-        return value
-    local = value.astimezone(tz).replace(tzinfo=None) + timedelta(days=days)
-    return local.replace(tzinfo=tz).astimezone(timezone.utc)
-
-
-def weekly_label(starts: list[datetime], tz: ZoneInfo) -> Optional[str]:
-    """"Every week on Wednesday until 9 December 2026" when the dates are exactly a
-    week apart (by local calendar day), otherwise None (repeat.ts weeklyLabel)."""
-    local = sorted(start.astimezone(tz) for start in starts)
-    if len(local) < 2:
-        return None
-    for before, after in zip(local, local[1:]):
-        if (after.date() - before.date()).days != 7:
-            return None
-    first, last = local[0], local[-1]
-    return (
-        f"Every week on {WEEKDAYS[first.weekday()]} until"
-        f" {last.day} {MONTHS[last.month - 1]} {last.year}"
-    )
-
-
-async def create_dates(
-    db: AsyncSession, event_id: UUID | str, dates: list[dict], user_id: UUID | str
-) -> dict:
-    """More dates for an event: each is its own event with the same details, tickets,
-    questions and guest-only details, all sharing one series (createMoreDates)."""
-    parent = await _event(db, event_id)
-    if parent["status"] not in ("draft", "published"):
-        raise HTTPException(status.HTTP_409_CONFLICT, "event_not_editable")
-    org = await _organiser(db, parent["organiser_id"])
-    _require_approved(org)
-
-    series_key = parent["series_key"] or f"orbit:{parent['id']}"
-    existing = {
-        row["starts_at"]
-        for row in await _all(
-            db,
-            "select starts_at from events where series_key = :k and organiser_id = :o"
-            " and status <> 'removed'",
-            {"k": series_key, "o": parent["organiser_id"]},
-        )
-    } | {parent["starts_at"]}
-    now = datetime.now(timezone.utc)
-    for slot in dates:
-        if slot["starts_at"] <= now:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "date_in_past")
-        if slot["starts_at"] in existing:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "duplicate_date")
-
-    tickets = await _all(
-        db,
-        "select name, description, price, currency, quantity, sales_end_at, sort_order"
-        " from ticket_types where event_id = :e order by sort_order, created_at",
-        {"e": parent["id"]},
-    )
-    questions = await _all(
-        db,
-        "select label, kind, options, required, sort_order from event_questions"
-        " where event_id = :e order by sort_order, created_at",
-        {"e": parent["id"]},
-    )
-    private = await _one(
-        db,
-        "select online_url, guest_info from event_private where event_id = :e",
-        {"e": parent["id"]},
-    )
-    publish = parent["status"] == "published"
-    if publish and parent["registration_mode"] == "tickets":
-        _require_charges(org, [ticket["price"] for ticket in tickets])
-
-    if not parent["series_key"]:
-        await db.execute(
-            text("update events set series_key = :k, updated_at = now() where id = :id"),
-            {"k": series_key, "id": parent["id"]},
-        )
-
-    tz = _zone(parent["timezone"])
-    parent_day = parent["starts_at"].astimezone(tz).date()
-    created: list[dict] = []
-    for slot in dates:
-        days = (slot["starts_at"].astimezone(tz).date() - parent_day).days
-        row = await _one(
-            db,
-            f"""
-            insert into events
-              ({DATE_COPY_COLUMNS}, starts_at, ends_at, registration_deadline, series_key,
-               status, source, created_by)
-            select {DATE_COPY_COLUMNS}, :starts_at, :ends_at, :deadline, :series_key,
-                   :status, 'orbit', :created_by
-              from events where id = :parent
-            returning id, starts_at, ends_at, status
-            """,
-            {
-                "starts_at": slot["starts_at"],
-                "ends_at": slot.get("ends_at"),
-                "deadline": _shift_local_days(parent["registration_deadline"], days, tz),
-                "series_key": series_key,
-                "status": "published" if publish else "draft",
-                "created_by": user_id,
-                "parent": parent["id"],
-            },
-        )
-        shifted = [
-            {**ticket, "sales_end_at": _shift_local_days(ticket["sales_end_at"], days, tz)}
-            for ticket in tickets
-        ]
-        await _sync_children(db, "ticket_types", row["id"], shifted, parent["currency"], set(), [])
-        await _sync_children(
-            db, "event_questions", row["id"], questions, parent["currency"], set(), []
-        )
-        if private:
-            await _save_private(db, row["id"], private)
-        created.append(row)
-
-    starts = [
-        row["starts_at"]
-        for row in await _all(
-            db,
-            "select starts_at from events where series_key = :k and organiser_id = :o"
-            " and status <> 'removed'",
-            {"k": series_key, "o": parent["organiser_id"]},
-        )
-    ]
-    label = weekly_label(starts, tz)
-    await db.execute(
-        text(
-            "update events set series_label = :label, updated_at = now()"
-            " where series_key = :k and organiser_id = :o"
-        ),
-        {"label": label, "k": series_key, "o": parent["organiser_id"]},
-    )
-    return {
-        "series_key": series_key,
-        "series_label": label,
-        "count": len(created),
-        "events": created,
-    }
-
-
 # ─── stats and guests ───────────────────────────────────────────────────────
 
 
@@ -1059,3 +891,171 @@ async def check_in_count(db: AsyncSession, event_id: UUID | str) -> dict:
         {"e": event_id},
     )
     return {"checked_in": int(row["checked_in"]), "going": int(row["going"])}
+
+
+# ─── more dates (a series) ──────────────────────────────────────────────────
+
+# Editor columns a new date copies from the event it was added to (formToEventRow).
+DATE_COPY_COLUMNS = (
+    "organiser_id, title, summary, description, cover_url, timezone, format, venue_name,"
+    " address, city, country, latitude, longitude, category_id, tags, university,"
+    " registration_mode, external_url, external_label, requires_approval, capacity,"
+    " waitlist_enabled, price_min, price_max, currency"
+)
+
+WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+MONTHS = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
+def _zone(name: Optional[str]) -> ZoneInfo:
+    try:
+        return ZoneInfo(name or settings.DEFAULT_TIMEZONE)
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo(settings.DEFAULT_TIMEZONE)
+
+
+def _shift_local_days(
+    value: Optional[datetime], days: int, tz: ZoneInfo
+) -> Optional[datetime]:
+    """The same wall-clock time `days` later in the event's zone (shiftLocalDays)."""
+    if value is None or days == 0:
+        return value
+    local = value.astimezone(tz).replace(tzinfo=None) + timedelta(days=days)
+    return local.replace(tzinfo=tz).astimezone(timezone.utc)
+
+
+def weekly_label(starts: list[datetime], tz: ZoneInfo) -> Optional[str]:
+    """"Every week on Wednesday until 9 December 2026" when the dates are exactly a
+    week apart (by local calendar day), otherwise None (repeat.ts weeklyLabel)."""
+    local = sorted(start.astimezone(tz) for start in starts)
+    if len(local) < 2:
+        return None
+    for before, after in zip(local, local[1:]):
+        if (after.date() - before.date()).days != 7:
+            return None
+    first, last = local[0], local[-1]
+    return (
+        f"Every week on {WEEKDAYS[first.weekday()]} until"
+        f" {last.day} {MONTHS[last.month - 1]} {last.year}"
+    )
+
+
+async def create_dates(
+    db: AsyncSession, event_id: UUID | str, dates: list[dict], user_id: UUID | str
+) -> dict:
+    """More dates for an event: each is its own event with the same details, tickets,
+    questions and guest-only details, all sharing one series (createMoreDates)."""
+    parent = await _event(db, event_id)
+    if parent["status"] not in ("draft", "published"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "event_not_editable")
+    org = await _organiser(db, parent["organiser_id"])
+    _require_approved(org)
+
+    series_key = parent["series_key"] or f"orbit:{parent['id']}"
+    existing = {
+        row["starts_at"]
+        for row in await _all(
+            db,
+            "select starts_at from events where series_key = :k and organiser_id = :o"
+            " and status <> 'removed'",
+            {"k": series_key, "o": parent["organiser_id"]},
+        )
+    } | {parent["starts_at"]}
+    now = datetime.now(timezone.utc)
+    for slot in dates:
+        if slot["starts_at"] <= now:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "date_in_past")
+        if slot["starts_at"] in existing:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "duplicate_date")
+
+    tickets = await _all(
+        db,
+        "select name, description, price, currency, quantity, sales_end_at, sort_order"
+        " from ticket_types where event_id = :e order by sort_order, created_at",
+        {"e": parent["id"]},
+    )
+    questions = await _all(
+        db,
+        "select label, kind, options, required, sort_order from event_questions"
+        " where event_id = :e order by sort_order, created_at",
+        {"e": parent["id"]},
+    )
+    private = await _one(
+        db,
+        "select online_url, guest_info from event_private where event_id = :e",
+        {"e": parent["id"]},
+    )
+    publish = parent["status"] == "published"
+    if publish and parent["registration_mode"] == "tickets":
+        _require_charges(org, [ticket["price"] for ticket in tickets])
+
+    if not parent["series_key"]:
+        await db.execute(
+            text("update events set series_key = :k, updated_at = now() where id = :id"),
+            {"k": series_key, "id": parent["id"]},
+        )
+
+    tz = _zone(parent["timezone"])
+    parent_day = parent["starts_at"].astimezone(tz).date()
+    created: list[dict] = []
+    for slot in dates:
+        days = (slot["starts_at"].astimezone(tz).date() - parent_day).days
+        row = await _one(
+            db,
+            f"""
+            insert into events
+              ({DATE_COPY_COLUMNS}, starts_at, ends_at, registration_deadline, series_key,
+               status, source, created_by)
+            select {DATE_COPY_COLUMNS}, :starts_at, :ends_at, :deadline, :series_key,
+                   :status, 'orbit', :created_by
+              from events where id = :parent
+            returning id, starts_at, ends_at, status
+            """,
+            {
+                "starts_at": slot["starts_at"],
+                "ends_at": slot.get("ends_at"),
+                "deadline": _shift_local_days(parent["registration_deadline"], days, tz),
+                "series_key": series_key,
+                "status": "published" if publish else "draft",
+                "created_by": user_id,
+                "parent": parent["id"],
+            },
+        )
+        shifted = [
+            {**ticket, "sales_end_at": _shift_local_days(ticket["sales_end_at"], days, tz)}
+            for ticket in tickets
+        ]
+        await _sync_children(db, "ticket_types", row["id"], shifted, parent["currency"], set(), [])
+        await _sync_children(
+            db, "event_questions", row["id"], questions, parent["currency"], set(), []
+        )
+        if private:
+            await _save_private(db, row["id"], private)
+        created.append(row)
+
+    starts = [
+        row["starts_at"]
+        for row in await _all(
+            db,
+            "select starts_at from events where series_key = :k and organiser_id = :o"
+            " and status <> 'removed'",
+            {"k": series_key, "o": parent["organiser_id"]},
+        )
+    ]
+    label = weekly_label(starts, tz)
+    await db.execute(
+        text(
+            "update events set series_label = :label, updated_at = now()"
+            " where series_key = :k and organiser_id = :o"
+        ),
+        {"label": label, "k": series_key, "o": parent["organiser_id"]},
+    )
+    return {
+        "series_key": series_key,
+        "series_label": label,
+        "count": len(created),
+        "events": created,
+    }
