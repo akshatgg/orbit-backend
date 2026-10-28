@@ -157,6 +157,9 @@ class EventPrivateOut(BaseModel):
 
 class EventDetail(EventCard):
     description: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    cancel_reason: str | None = None
     ticket_types: list[TicketTypeAvailability] = Field(default_factory=list)
     event_questions: list[EventQuestionOut] = Field(default_factory=list)
     spots_left: int | None = None

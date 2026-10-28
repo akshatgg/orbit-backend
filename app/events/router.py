@@ -178,10 +178,9 @@ async def get_event(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Event not found")
 
     event = row[0]
-    can_manage = False
-    if user:
-        can_manage = await fn.can_manage_event(db, event_id)
-    if (event.status != "published" or event.duplicate_of is not None) and not can_manage:
+    can_manage = bool(user) and await fn.can_manage_event(db, event_id)
+    # Cancelled and expired events keep their page; drafts and removed ones are the team's only.
+    if not (can_manage or svc.publicly_visible(event, row[1])):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Event not found")
 
     return await svc.detail(db, event, row[1], row[2], user, can_manage)
@@ -374,11 +373,10 @@ async def _event_or_404(db: AsyncSession, event_id: UUID) -> Event:
 
 
 async def _visible_event(db: AsyncSession, event_id: UUID, user: dict | None) -> Event:
-    event = await _event_or_404(db, event_id)
-    if event.status == "published" and event.duplicate_of is None:
-        return event
-    if user and await fn.can_manage_event(db, event_id):
-        return event
+    """The event if the viewer may open its page (the same rule as GET /events/{id}), else 404."""
+    row = await svc.event_row(db, event_id)
+    if row and await svc.can_view(db, row[0], row[1], user):
+        return row[0]
     raise HTTPException(status.HTTP_404_NOT_FOUND, "Event not found")
 
 
