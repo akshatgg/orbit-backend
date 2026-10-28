@@ -59,12 +59,14 @@ def _login_error(kind: str) -> RedirectResponse:
 
 
 @router.post("/signup", response_model=None, status_code=201)
-async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)):
-    """Create an account: with a password it signs in, without one it emails a magic link."""
+async def signup(body: SignupRequest, response: Response, db: AsyncSession = Depends(get_db)):
+    """Create an account: with a password it signs in (cookie + token), without one it
+    emails a magic link."""
     user = await service.get_or_create_user(db, body.email, full_name=body.full_name)
     if body.password:
         await service.set_password(db, user, body.password)
         token = service.session_token(user)
+        _set_cookie(response, token)
         return AuthResponse(access_token=token, user=_user_out(
             {"id": user.id, "email": user.email, "full_name": body.full_name}
         ))
