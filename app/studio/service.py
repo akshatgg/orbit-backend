@@ -21,6 +21,7 @@ from app.core.config import settings
 from app.core.pagination import offset
 from app.organisers.service import EVENT_COLUMNS, with_counts
 from app.sql import functions as fn
+from app.uploads.release import release_images
 
 STATUSES = (
     "going",
@@ -432,6 +433,7 @@ async def delete_event(db: AsyncSession, event_id: UUID | str) -> None:
             status.HTTP_409_CONFLICT, "Only drafts can be deleted — cancel it instead"
         )
     await db.execute(text("delete from events where id = :id"), {"id": event_id})
+    await release_images(db, [event["cover_url"]])
 
 
 # ─── stats and guests ───────────────────────────────────────────────────────

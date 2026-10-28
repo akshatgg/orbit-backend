@@ -35,6 +35,7 @@ from app.events.models import Event
 from app.organisers.models import Organiser, OrganiserMember
 from app.sources.models import EventSource
 from app.sql import functions as fn
+from app.uploads.release import release_images
 from app.users.models import Profile, User
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -424,7 +425,9 @@ async def admin_bulk_delete(
     admin: dict = Depends(require_admin),
 ) -> dict[str, int]:
     """Permanently delete many events."""
+    covers = (await db.scalars(select(Event.cover_url).where(Event.id.in_(body.ids)))).all()
     result = await db.execute(delete(Event).where(Event.id.in_(body.ids)))
+    await release_images(db, covers)
     deleted = result.rowcount or 0
     await fn.log_admin_action(
         db, "event.delete", "event", None, {"count": deleted, "bulk": True}
@@ -581,6 +584,7 @@ async def admin_delete_event(
         db, "event.delete", "event", str(event_id), {"title": event.title}
     )
     await db.execute(delete(Event).where(Event.id == event_id))
+    await release_images(db, [event.cover_url])
     return {"deleted": True}
 
 
