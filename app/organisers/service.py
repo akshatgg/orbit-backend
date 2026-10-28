@@ -348,6 +348,21 @@ async def team(db: AsyncSession, organiser_id: UUID | str) -> list[dict]:
 async def add_member(
     db: AsyncSession, organiser_id: UUID | str, email: str, role: str
 ) -> dict:
+    # The team panel only ever adds people: someone already on the team keeps their role.
+    # (The SQL upsert would quietly change it, even demoting the only owner.)
+    existing = await _val(
+        db,
+        """
+        select m.role
+          from organiser_members m
+          join profiles p on p.id = m.user_id
+         where m.organiser_id = :o and lower(p.email) = lower(:e)
+         limit 1
+        """,
+        {"o": organiser_id, "e": str(email).strip()},
+    )
+    if existing:
+        raise HTTPException(status.HTTP_409_CONFLICT, "already_on_team")
     try:
         # Refuses an unknown email with the sentence the team panel showed.
         user_id = await fn.add_organiser_member(db, organiser_id, str(email).strip(), role)
