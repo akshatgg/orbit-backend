@@ -402,3 +402,56 @@ _LOCATION_SPACES = re.compile(r"\s+")
 def clean_location(raw: str) -> str:
     """Letters, numbers, spaces and a little punctuation (the frontend's `cleanLocation`)."""
     return _LOCATION_SPACES.sub(" ", _NOT_LOCATION.sub(" ", raw)).strip()[:60]
+
+
+def country_name(code: str) -> str:
+    """"IN" -> "India", "GB" -> "United Kingdom"."""
+    return COUNTRY_NAMES.get(code, code)
+
+
+_COUNTRY_CODE = re.compile(r"^[A-Z]{2}$")
+
+
+def country_flag(code: str) -> str:
+    """"IN" -> the Indian flag emoji."""
+    return "".join(chr(0x1F1A5 + ord(c)) for c in code) if _COUNTRY_CODE.match(code) else ""
+
+
+def _collate(value: str) -> tuple[str, str]:
+    """Roughly `localeCompare` order: letters before case, then case."""
+    return (value.casefold(), value)
+
+
+def group_places(rows: list[dict]) -> list[dict]:
+    """Upcoming events as country → city lists with counts, biggest first (`groupPlaces`).
+
+    `rows` carry `id`, `city`, `country`, `series_key`. A recurring series counts once. Places
+    without a known country come last as "Other places".
+    """
+    countries: dict[str, dict] = {}
+    for row in rows:
+        place = place_of(row["city"], row["country"])
+        if not place["country"] and not place["city"]:
+            continue
+        key = row["series_key"] or str(row["id"])
+        group = countries.setdefault(place["country"] or "", {"all": set(), "cities": {}})
+        group["all"].add(key)
+        if place["city"]:
+            group["cities"].setdefault(place["city"], set()).add(key)
+    groups = [
+        {
+            "country": code or None,
+            "name": country_name(code) if code else "Other places",
+            "flag": country_flag(code) if code else "",
+            "events": len(group["all"]),
+            "cities": sorted(
+                ({"city": city, "events": len(keys)} for city, keys in group["cities"].items()),
+                key=lambda c: (-c["events"], _collate(c["city"])),
+            ),
+        }
+        for code, group in countries.items()
+    ]
+    return sorted(
+        (g for g in groups if g["country"] or g["cities"]),
+        key=lambda g: (g["country"] is None, -g["events"], _collate(g["name"])),
+    )
