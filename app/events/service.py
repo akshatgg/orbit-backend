@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
+from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +22,7 @@ from app.users.models import EventInteraction, UserEvent
 logger = logging.getLogger(__name__)
 
 EMPTY_COUNTS = {"going": 0, "waitlisted": 0, "pending": 0}
+MAX_IDS = 200
 
 INTERESTS = [
     ("entrepreneurship", "Entrepreneurship"),
@@ -166,6 +168,39 @@ async def counts_map(db: AsyncSession, event_ids: list[UUID]) -> dict[UUID, dict
     }
 
 
+def parse_ids(raw: str | None, *, limit: int = MAX_IDS, name: str = "ids") -> list[UUID]:
+    """A comma-separated list of event ids: blanks dropped, duplicates removed, order kept.
+
+    422 for a malformed id or more than `limit` ids.
+    """
+    ids: list[UUID] = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = UUID(part)
+        except ValueError:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, f"{name}: {part!r} is not an event id"
+            ) from None
+        if value not in ids:
+            ids.append(value)
+    if len(ids) > limit:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, f"{name}: at most {limit} ids per request"
+        )
+    return ids
+
+
+async def counts_rows(db: AsyncSession, event_ids: list[UUID]) -> list[dict]:
+    """One counts row per requested id, zeros for events nobody registered for."""
+    counts = await counts_map(db, event_ids)
+    return [
+        {"event_id": event_id, **counts.get(event_id, EMPTY_COUNTS)} for event_id in event_ids
+    ]
+
+
 async def cards(db: AsyncSession, stmt) -> list[dict]:
     """Run a `card_query()` statement and attach counts."""
     rows = (await db.execute(stmt)).all()
@@ -274,10 +309,14 @@ async def detail(
                 )
             ).all()
         )
-        if registration and registration.status == "going":
+        if can_manage or (registration and registration.status == "going"):
             row = await db.get(EventPrivate, event.id)
-            if row:
+            if row and (row.online_url or row.guest_info):
                 private = {"online_url": row.online_url, "guest_info": row.guest_info}
+
+    remaining = {
+        row["ticket_type_id"]: row["remaining"] for row in await fn.ticket_availability(db, event.id)
+    }
 
     series: list[dict] = []
     if event.series_key:
@@ -309,7 +348,9 @@ async def detail(
     return {
         **card(event, organiser, category, counts),
         "description": event.description,
-        "ticket_types": [ticket_dict(ticket) for ticket in tickets],
+        "ticket_types": [
+            {**ticket_dict(ticket), "remaining": remaining.get(ticket.id)} for ticket in tickets
+        ],
         "event_questions": [question_dict(question) for question in questions],
         "spots_left": None if event.capacity is None else max(0, event.capacity - counts["going"]),
         "can_manage": can_manage,

@@ -17,6 +17,7 @@ from app.core.pagination import offset, pagination
 from app.events import service as svc
 from app.events.models import Event
 from app.events.schemas import (
+    EventCountsRow,
     EventDetail,
     EventFormat,
     EventPage,
@@ -134,6 +135,15 @@ async def happening_soon(db: AsyncSession = Depends(get_db)) -> dict:
         db, svc.card_query().where(*conditions).order_by(Event.starts_at).limit(12)
     )
     return svc.page(items, len(items), 1, 12)
+
+
+@router.get("/counts", response_model=list[EventCountsRow])
+async def event_counts(
+    ids: str = Query(description="Comma-separated event ids, at most 200"),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    """Going / waitlisted / pending for each id, in the order asked (zeros when none)."""
+    return await svc.counts_rows(db, svc.parse_ids(ids))
 
 
 @router.get("/{event_id}", response_model=EventDetail)
