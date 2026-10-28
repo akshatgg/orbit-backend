@@ -55,7 +55,8 @@ class EventCreate(BaseModel):
     organiser_id: UUID | None = None
     tags: list[str] = Field(default_factory=list)
     university: str | None = Field(default=None, max_length=120)
-    registration_mode: RegistrationMode = "tickets"
+    # Admin events register elsewhere or not at all; ticketed events belong to an organiser.
+    registration_mode: RegistrationMode = "none"
     external_url: str | None = None
     external_label: str = Field(default="Apply now", max_length=40)
     requires_approval: bool = False
