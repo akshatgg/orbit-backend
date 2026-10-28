@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Writes /etc/markai-orbit/orbit.env (mode 600) from:
+#   /opt/markai-orbit/settings.env   repo defaults
+#   /etc/markai-orbit/site.env       this host: ORBIT_SITE, BACKEND_URL, ...
+#   Secret Manager                   MARKAI_ORBIT_<NAME>
+# Optional integrations are included only when their secret exists, so adding
+# one later is: create the secret, then run bin/deploy again.
+set -euo pipefail
+export PATH="/snap/bin:$PATH"
+
+PROJECT=markai-499512
+ROOT=/opt/markai-orbit
+ETC=/etc/markai-orbit
+
+secret() { gcloud secrets versions access latest --secret "MARKAI_ORBIT_$1" --project "$PROJECT" 2>/dev/null; }
+
+umask 077
+tmp=$(mktemp "$ETC/orbit.env.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+{
+  cat "$ROOT/settings.env"
+  cat "$ETC/site.env"
+  for name in JWT_SECRET CRON_SECRET POSTGRES_PASSWORD; do
+    value=$(secret "$name") || { echo "[render-env] missing required secret MARKAI_ORBIT_$name" >&2; exit 1; }
+    echo "$name=$value"
+  done
+  for name in GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET RESEND_API_KEY EMAIL_FROM \
+              STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET \
+              CLOUDINARY_CLOUD_NAME CLOUDINARY_API_KEY CLOUDINARY_API_SECRET \
+              VAPID_PUBLIC_KEY VAPID_PRIVATE_KEY SUPER_ADMIN_EMAIL; do
+    if value=$(secret "$name"); then echo "$name=$value"; fi
+  done
+} > "$tmp"
+mv "$tmp" "$ETC/orbit.env"
+trap - EXIT
+echo "[render-env] wrote $ETC/orbit.env"

@@ -1,0 +1,13 @@
+# ORBIT_SITE comes from /etc/markai-orbit/site.env.
+#
+#   ORBIT_SITE=:80              plain HTTP on the VM's IP (no domain yet)
+#   ORBIT_SITE=api.example.com  Caddy gets a Let's Encrypt certificate over
+#                               HTTP-01 and redirects HTTP to HTTPS
+#
+# Point the domain's A record at the VM first, then change ORBIT_SITE and run
+# `docker compose up -d web`.
+{$ORBIT_SITE} {
+	encode zstd gzip
+	reverse_proxy orbit:8090
+	log
+}

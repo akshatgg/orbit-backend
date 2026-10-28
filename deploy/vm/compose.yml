@@ -1,0 +1,48 @@
+# markai-orbit on its GCE VM. One container holds Postgres 17 and the API
+# (Dockerfile.single); Caddy in front only terminates HTTP/HTTPS.
+#
+# Lives at /opt/markai-orbit on the VM. bin/deploy writes ORBIT_IMAGE into
+# /opt/markai-orbit/.env, which compose reads for the substitution below.
+name: markai-orbit
+
+services:
+  orbit:
+    image: ${ORBIT_IMAGE:?set by bin/deploy}
+    container_name: markai-orbit
+    restart: unless-stopped
+    env_file: /etc/markai-orbit/orbit.env
+    volumes:
+      # The database. Without this mount every row is lost on the next deploy.
+      - /var/lib/markai-orbit/pgdata:/var/lib/postgresql/data
+    # Docker's 64 MB default /dev/shm is too small for Postgres parallel queries.
+    shm_size: 256m
+    # Measured peak under load: ~300 MiB for Postgres + API together.
+    mem_limit: 1g
+    # Give the entrypoint time to stop uvicorn and then Postgres cleanly.
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # First boot initialises Postgres, migrates and loads the seed.
+      start_period: 180s
+    logging:
+      driver: gcplogs
+
+  web:
+    image: caddy:2.11.4
+    container_name: markai-orbit-web
+    restart: unless-stopped
+    depends_on: [orbit]
+    ports:
+      - "80:80"
+      - "443:443"
+    env_file: /etc/markai-orbit/site.env
+    volumes:
+      # Mount the directory, not the file: a single-file bind mount keeps the
+      # old inode and silently ignores a replaced Caddyfile.
+      - ./caddy:/etc/caddy:ro
+      - /var/lib/markai-orbit/caddy:/data
+    logging:
+      driver: gcplogs

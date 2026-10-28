@@ -1,0 +1,20 @@
+{
+  "generated_from": "asfehvdglmljdimgagxr.supabase.co",
+  "generated_at": "2026-10-28",
+  "objects": [
+    {
+      "bucket": "organiser-logos",
+      "path": "fbf60831-5218-4621-ae40-cb9587e3da5f/a81f670b-c553-4de0-88d2-4efb183a8c33.jpg",
+      "local_file": "seeds/storage/logo.jpg",
+      "bytes": 1238543,
+      "content_type": "image/jpeg",
+      "public_url": "https://asfehvdglmljdimgagxr.supabase.co/storage/v1/object/public/organiser-logos/fbf60831-5218-4621-ae40-cb9587e3da5f/a81f670b-c553-4de0-88d2-4efb183a8c33.jpg",
+      "referenced_by": null,
+      "note": "Orphan test upload: no profile, event or organiser row points at it. Kept so the export is complete; safe to delete after the cutover."
+    }
+  ],
+  "not_exported": {
+    "media": "822 event covers are Cloudinary URLs; there are 0 covers or avatars on Supabase Storage, so no media files need moving.",
+    "auth_sessions": "auth.sessions, auth.refresh_tokens, auth.flow_state are deliberately excluded: they are invalid against the new server and keeping them would carry live credentials across."
+  }
+}

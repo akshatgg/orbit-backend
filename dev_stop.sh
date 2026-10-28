@@ -16,7 +16,7 @@ PORT="${PORT:-8090}"
 echo -e "${YELLOW}Stopping Orbit backend...${NC}"
 
 if command -v lsof >/dev/null 2>&1; then
-    PIDS=$(lsof -ti:"$PORT" 2>/dev/null || true)
+    PIDS=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null || true)
     if [ -n "${PIDS:-}" ]; then
         echo -e "${YELLOW}Killing uvicorn on port $PORT ($(echo "$PIDS" | tr '\n' ' '))${NC}"
         while IFS= read -r pid; do

@@ -1,0 +1,40 @@
+# Push-to-deploy for markai-orbit, run by the Cloud Build trigger
+# `markai-orbit-deploy` on every push to master:
+#   build the single-container image  ->  push it  ->  SSH (IAP) into the VM
+#   and run bin/deploy, which swaps the container and waits for healthy.
+# A container that does not come up healthy fails the build.
+#
+# Manual run of the same pipeline:
+#   gcloud builds submit --project markai-499512 \
+#     --config deploy/vm/cloudbuild-deploy.yaml --substitutions _TAG=$(git rev-parse --short HEAD) .
+steps:
+  - id: Build
+    name: gcr.io/cloud-builders/docker
+    args: [build, -f, Dockerfile.single, -t, "${_IMAGE}:${_TAG}", .]
+
+  - id: Push
+    name: gcr.io/cloud-builders/docker
+    args: [push, "${_IMAGE}:${_TAG}"]
+
+  - id: Deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        command -v ssh >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq openssh-client; }
+        gcloud compute ssh markai-orbit --zone=us-central1-a --project=$PROJECT_ID \
+          --tunnel-through-iap --quiet --ssh-key-expire-after=30m \
+          --command="sudo /opt/markai-orbit/bin/deploy ${_IMAGE}:${_TAG}"
+
+substitutions:
+  _IMAGE: us-central1-docker.pkg.dev/${PROJECT_ID}/markai/markai-orbit
+  _TAG: ${SHORT_SHA}
+
+images:
+  - "${_IMAGE}:${_TAG}"
+
+options:
+  dynamicSubstitutions: true
+  logging: CLOUD_LOGGING_ONLY

@@ -89,14 +89,14 @@ _COUNTRY_NAMES = {
 
 def source_key(source_id: UUID | str) -> str:
     """The `events.source` value for events imported from this source."""
-    return f"src-{source_id}"
+    return f"source:{source_id}"
 
 
 def source_id_from_key(source: str | None) -> UUID | None:
-    if not source or not source.startswith("src-"):
+    if not source or not source.startswith("source:"):
         return None
     try:
-        return UUID(source[4:])
+        return UUID(source.split(":", 1)[1])
     except ValueError:
         return None
 
