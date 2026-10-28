@@ -1,1 +1,1 @@
-"""Uploads: Cloudinary signatures or local image storage."""
+"""Uploads: Cloudinary signatures and image release."""
