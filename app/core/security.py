@@ -48,9 +48,3 @@ def new_opaque_token() -> str:
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def sign_upload(params: dict[str, Any]) -> str:
-    """Cloudinary signature: sha1 of the sorted params + the API secret."""
-    to_sign = "&".join(f"{k}={params[k]}" for k in sorted(params))
-    return hashlib.sha1(f"{to_sign}{settings.CLOUDINARY_API_SECRET}".encode()).hexdigest()

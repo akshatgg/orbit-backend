@@ -1,8 +1,9 @@
 """Auth: password, magic link, Google OAuth, sign-out, session."""
 
-from urllib.parse import urlencode
+import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +13,8 @@ from app.auth.schemas import AuthResponse, LoginRequest, MagicLinkRequest, Signu
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import require_user
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -35,16 +38,35 @@ def _set_cookie(response, token: str) -> None:
         secure=not settings.is_local,
         samesite="lax",
         path="/",
+        domain=settings.SESSION_COOKIE_DOMAIN or None,
+    )
+
+
+def _clear_cookie(response) -> None:
+    """Expire the session cookie; with a shared domain, also the old host-only one."""
+    response.delete_cookie(
+        settings.SESSION_COOKIE, path="/", domain=settings.SESSION_COOKIE_DOMAIN or None
+    )
+    if settings.SESSION_COOKIE_DOMAIN:
+        response.delete_cookie(settings.SESSION_COOKIE, path="/")
+
+
+def _login_error(kind: str) -> RedirectResponse:
+    """Send a failed sign-in back to the login page, which explains `?error=`."""
+    return RedirectResponse(
+        f"{settings.FRONTEND_URL}/login?error={kind}", status_code=status.HTTP_303_SEE_OTHER
     )
 
 
 @router.post("/signup", response_model=None, status_code=201)
-async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)):
-    """Create an account: with a password it signs in, without one it emails a magic link."""
+async def signup(body: SignupRequest, response: Response, db: AsyncSession = Depends(get_db)):
+    """Create an account: with a password it signs in (cookie + token), without one it
+    emails a magic link."""
     user = await service.get_or_create_user(db, body.email, full_name=body.full_name)
     if body.password:
         await service.set_password(db, user, body.password)
         token = service.session_token(user)
+        _set_cookie(response, token)
         return AuthResponse(access_token=token, user=_user_out(
             {"id": user.id, "email": user.email, "full_name": body.full_name}
         ))
@@ -53,8 +75,8 @@ async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/login", response_model=AuthResponse)
-async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
-    """Email + password sign-in."""
+async def login(body: LoginRequest, response: Response, db: AsyncSession = Depends(get_db)):
+    """Email + password sign-in. Sets the session cookie and returns the token."""
     user = await service.authenticate(db, body.email, body.password)
     profile = (
         await db.execute(
@@ -62,8 +84,10 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
             {"id": user.id},
         )
     ).mappings().first()
+    token = service.session_token(user)
+    _set_cookie(response, token)
     return AuthResponse(
-        access_token=service.session_token(user),
+        access_token=token,
         user=_user_out({"id": user.id, "email": user.email, **dict(profile or {})}),
     )
 
@@ -76,11 +100,14 @@ async def magic_link(body: MagicLinkRequest, db: AsyncSession = Depends(get_db))
 
 
 @router.get("/confirm")
-async def confirm(token: str = Query(min_length=10), next: str | None = None, db: AsyncSession = Depends(get_db)):
-    """Consume a magic-link token, set the session cookie and land the user back in the app."""
-    user = await service.consume_token(db, token, ("magic_link", "verify_email"))
+async def confirm(token: str = "", next: str | None = None, db: AsyncSession = Depends(get_db)):
+    """Consume a magic-link token, set the session cookie and land the user back in the app.
+
+    An expired, used or malformed link goes to `/login?error=link`.
+    """
+    user = await service.consume_token(db, token, ("magic_link", "verify_email")) if token else None
     if not user:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "That link has expired or was already used")
+        return _login_error("link")
     response = RedirectResponse(settings.FRONTEND_URL + service.safe_next(next))
     _set_cookie(response, service.session_token(user))
     return response
@@ -101,11 +128,21 @@ async def google_callback(
     error: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Google's redirect: exchange the code, upsert the account, set the cookie."""
+    """Google's redirect: exchange the code, upsert the account, set the cookie.
+
+    A cancelled, forged or failed sign-in goes to `/login?error=auth`.
+    """
     if error or not code or not state:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Google sign-in was cancelled")
-    next_path = service.read_google_state(state)
-    user = await service.google_user(db, code)
+        return _login_error("auth")
+    try:
+        next_path = service.read_google_state(state)
+        user = await service.google_user(db, code)
+    except HTTPException as exc:
+        logger.info("Google sign-in refused: %s", exc.detail)
+        return _login_error("auth")
+    except (httpx.HTTPError, ValueError):
+        logger.warning("Google sign-in failed", exc_info=True)
+        return _login_error("auth")
     response = RedirectResponse(settings.FRONTEND_URL + next_path)
     _set_cookie(response, service.session_token(user))
     return response
@@ -115,7 +152,7 @@ async def google_callback(
 async def signout():
     """Clear the session cookie."""
     response = JSONResponse({"ok": True})
-    response.delete_cookie(settings.SESSION_COOKIE, path="/")
+    _clear_cookie(response)
     return response
 
 

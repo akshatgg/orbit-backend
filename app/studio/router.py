@@ -15,6 +15,7 @@ from .schemas import (
     CancelIn,
     CheckInByRegistrationIn,
     CheckInIn,
+    DatesIn,
     DecisionIn,
     EventCreate,
     EventUpdate,
@@ -33,6 +34,22 @@ async def overview(
     """Dashboard numbers for one organiser: events, followers, registrations, next event."""
     await org_role(db, organiser_id, user)
     return await service.overview(db, organiser_id)
+
+
+@router.get("/events")
+async def list_events(
+    organiser_id: UUID = Query(),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(500, ge=1, le=500),
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Every event of the organiser in any status, newest start first, with counts.
+
+    Members only (the require_org_member rule, via org_role so a malformed id is a 422).
+    """
+    await org_role(db, organiser_id, user)
+    return await service.list_events(db, organiser_id, page, page_size)
 
 
 @router.get("/events/{event_id}")
@@ -63,8 +80,28 @@ async def update_event(
     user: dict = Depends(require_event_manager),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Edit an event; ticket types and questions are replaced when supplied."""
-    return await service.update_event(db, event_id, body.model_dump(exclude_unset=True))
+    """Edit an event. Ticket types and questions, when supplied, are synced by id:
+    rows with an id are updated, rows without one are added, missing ones are deleted."""
+    data = body.model_dump(exclude_unset=True)
+    # exclude_unset also drops unset fields inside each row; rows keep their defaults.
+    for key in ("ticket_types", "questions"):
+        rows = getattr(body, key)
+        if rows is not None:
+            data[key] = [row.model_dump() for row in rows]
+    return await service.update_event(db, event_id, data)
+
+
+@router.post("/events/{event_id}/dates", status_code=status.HTTP_201_CREATED)
+async def add_dates(
+    event_id: UUID,
+    body: DatesIn,
+    user: dict = Depends(require_event_manager),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """More dates for the event, each its own event in the same series."""
+    return await service.create_dates(
+        db, event_id, [slot.model_dump() for slot in body.dates], user["id"]
+    )
 
 
 @router.post("/events/{event_id}/publish")
@@ -84,7 +121,7 @@ async def cancel_event(
     user: dict = Depends(require_event_manager),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Cancel an event and record why."""
+    """Cancel a published event and record why."""
     return await service.cancel_event(db, event_id, body.reason)
 
 
