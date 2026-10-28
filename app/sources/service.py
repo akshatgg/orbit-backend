@@ -65,6 +65,15 @@ SKIPPED_FIELDS: dict[str, tuple[str, ...]] = {
     "eventbrite": ("description",),
 }
 
+# Location fields Luma page reads fill in when the listing hides the place until you register.
+# A later sync never empties them again: only a real (non-empty) value from the listing replaces
+# what's stored. Deliberate divergence from the TypeScript engine (approved by Akshat), which
+# nulled them on every run so the same events were rewritten nightly.
+KEEP_FILLED_FIELDS: dict[str, tuple[str, ...]] = {
+    "luma": ("venue_name", "address", "latitude", "longitude"),
+    "luma-discover": ("venue_name", "address", "latitude", "longitude"),
+}
+
 # Kinds that read a platform's search or listing rather than a full calendar. Events drop out
 # of those lists while their pages stay up, so a run only adds and updates: it never flags an
 # event as missing (a cancellation the platform reports is still flagged).
@@ -183,9 +192,13 @@ def _same_coordinate(a: Any, b: Any) -> bool:
     return abs(js.number(a) - js.number(b)) < 1e-6
 
 
-def changed_fields(existing: dict[str, Any], incoming: dict[str, Any], skip: Iterable[str] = ()) -> dict[str, Any]:
-    """Only the fields that actually changed (empty when nothing did)."""
+def changed_fields(
+    existing: dict[str, Any], incoming: dict[str, Any], skip: Iterable[str] = (), keep_filled: Iterable[str] = ()
+) -> dict[str, Any]:
+    """Only the fields that actually changed (empty when nothing did). `keep_filled` fields are
+    never emptied: an empty incoming value leaves a stored one alone."""
     skipped = set(skip)
+    kept = set(keep_filled)
     nxt = {k: v for k, v in incoming.items() if k not in skipped}
     if existing.get("registration_mode") == "tickets":
         # An admin switched this event to Orbit tickets: leave registration alone.
@@ -194,6 +207,8 @@ def changed_fields(existing: dict[str, Any], incoming: dict[str, Any], skip: Ite
     patch: dict[str, Any] = {}
     for key, value in nxt.items():
         current = existing.get(key)
+        if key in kept and (value is None or value == "") and current is not None and current != "":
+            continue
         if key in ("starts_at", "ends_at"):
             same = _same_instant(current, value)
         elif key in ("latitude", "longitude"):
@@ -213,6 +228,7 @@ def plan_sync(
     feed_url: str,
     previous_run_started_at: datetime | None,
     skip: Iterable[str] = (),
+    keep_filled: Iterable[str] = (),
     coverage: str | dict[str, Any] = "complete",
 ) -> dict[str, list[Any]]:
     """Works out inserts / updates / unchanged / flags; events are matched by source_event_id."""
@@ -264,7 +280,7 @@ def plan_sync(
         # Flagged as missing or cancelled, but the source lists it again (as live): nothing to decide.
         if current.get("needs_review") and not current.get("duplicate_of"):
             plan["unflagged"].append(current["id"])
-        patch = changed_fields(current, synced_fields(event, feed_url), skip)
+        patch = changed_fields(current, synced_fields(event, feed_url), skip, keep_filled)
         if rekeyed:
             patch["source_event_id"] = event["source_event_id"]
         if patch:
@@ -471,7 +487,7 @@ async def run_source(
             existing = await _existing(db, key)
             plan = plan_sync(
                 existing, events, now=now, feed_url=source["url"], previous_run_started_at=previous_run_started_at,
-                skip=SKIPPED_FIELDS.get(source["kind"], ()),
+                skip=SKIPPED_FIELDS.get(source["kind"], ()), keep_filled=KEEP_FILLED_FIELDS.get(source["kind"], ()),
                 # A search or listing only adds and updates: events that drop out of it are still on the platform.
                 coverage="sample" if source["kind"] in ADD_ONLY_KINDS else fetched.coverage,
             )
