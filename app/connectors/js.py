@@ -17,9 +17,9 @@ from typing import Any
 
 # What JavaScript's \s, \S and String.prototype.trim() treat as whitespace.
 WS_CHARS = (
-    "\t\n\v\f\r   "
+    "\t\n\v\f\r \u00a0\u1680"
     + "".join(chr(c) for c in range(0x2000, 0x200B))
-    + "    　﻿"
+    + "\u2028\u2029\u202f\u205f\u3000\ufeff"
 )
 _WS_CLASS = "\\t\\n\\v\\f\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff"
 S = f"[{_WS_CLASS}]"  # JavaScript \s

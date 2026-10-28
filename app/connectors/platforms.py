@@ -310,7 +310,7 @@ def resolve_feed_url(kind: str, value: str) -> FeedUrlResult:
 # Luma's feed DESCRIPTION is only a stub:
 #   "Get up-to-date information at: https://luma.com/<slug>\n\nAddress:\n…\n\nHosted by <host>"
 _LUMA_LINK = re.compile(r"https://(?:www\.)?(?:luma\.com|lu\.ma)/[A-Za-z0-9_-]+")
-_HOSTED_BY = re.compile(r"(?:^|(?<=[\n\r  ]))Hosted by ([^\n\r  ]+)(?=[\n\r  ]|\Z)")
+_HOSTED_BY = re.compile(r"(?:^|(?<=[\n\r\u2028\u2029]))Hosted by ([^\n\r\u2028\u2029]+)(?=[\n\r\u2028\u2029]|\Z)")
 
 
 def clean_event(kind: str, event: dict[str, Any]) -> dict[str, Any]:

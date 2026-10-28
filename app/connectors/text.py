@@ -23,9 +23,9 @@ _NAMED_ENTITIES = {
     "hellip": "…", "rsquo": "’", "lsquo": "‘", "rdquo": "”", "ldquo": "“", "pound": "£", "euro": "€", "copy": "©",
 }
 
-# JavaScript's multiline ^ and $ also break at \r,   and  .
-_BOL = r"(?:^|(?<=[\r  ]))"
-_EOL = r"(?=[\n\r  ]|\Z)"
+# JavaScript's multiline ^ and $ also break at \r, \u2028 and \u2029.
+_BOL = r"(?:^|(?<=[\r\u2028\u2029]))"
+_EOL = r"(?=[\n\r\u2028\u2029]|\Z)"
 
 _ENTITY = re.compile(r"&(#x[0-9a-f]+|#[0-9]+|[a-z]+);", re.I | re.A)
 
@@ -86,9 +86,9 @@ _INDENTED = re.compile(f"^[ \\t]+{js.NS}")
 
 
 def _line_item(line: str) -> re.Match | None:
-    # JS `.` stops at \r,   and   (lines were split on \n only).
+    # JS `.` stops at \r, \u2028 and \u2029 (lines were split on \n only).
     match = _ORDERED_ITEM.match(line)
-    if match and re.search(r"[\r  ]", match.group(1)):
+    if match and re.search(r"[\r\u2028\u2029]", match.group(1)):
         return None
     return match
 
@@ -116,7 +116,7 @@ def _renumber_ordered_lists(value: str) -> str:
     return "\n".join(lines)
 
 
-_ZERO_WIDTH = re.compile(r"[​-‍﻿]")
+_ZERO_WIDTH = re.compile(r"[\u200b-\u200d\ufeff]")
 _ESCAPED = re.compile(r"\\([\\`*_{}\[\]()#+\-.!|>~,])")
 _IMAGE = re.compile(r"!\[([^\]]*)\]\((https?://[^)" + js.S_IN + r"]+)(?:" + js.S + r"+\"[^\"]*\")?\)")
 _LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)" + js.S_IN + r"]+)(?:" + js.S + r"+\"[^\"]*\")?\)")
@@ -147,7 +147,7 @@ def clean_prose(value: str | None, keep_emphasis: bool = False) -> str:
         return ""
     text = _CRLF.sub("\n", value)
     text = _ZERO_WIDTH.sub("", text)
-    text = text.replace(" ", " ")
+    text = text.replace("\u00a0", " ")
     text = _ESCAPED.sub(r"\1", text)
     text = _IMAGE.sub(r"\1", text)
     text = _LINK.sub(_link, text)
