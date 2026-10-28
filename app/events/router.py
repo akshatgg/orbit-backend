@@ -5,15 +5,17 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import RedirectResponse
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.categories.models import Category
 from app.core.database import get_db
 from app.core.deps import current_user, require_user
 from app.core.pagination import offset, pagination
+from app.discovery.dates import DatePreset, date_preset_range
+from app.discovery.places import clean_location
+from app.discovery.rank import load_viewer, rank_events, sort_results
 from app.events import service as svc
 from app.events.models import Event
 from app.events.schemas import (
@@ -42,42 +44,57 @@ async def list_events(
     q: str = "",
     category: list[str] = Query(default=[]),
     interest: list[str] = Query(default=[]),
-    format: EventFormat | None = None,
+    format: list[EventFormat] = Query(default=[]),
+    date: DatePreset | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
     country: str | None = Query(default=None, min_length=2, max_length=2),
     city: str | None = None,
     sort: EventSort = "soonest",
     pager: tuple[int, int] = Depends(pagination),
+    user: dict | None = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Search published events by text, category, interest, format, date and place."""
-    page_number, page_size = pager
-    conditions = svc.visible()
+    """Search published events like the frontend's Explore, one card per recurring series.
 
-    if q.strip():
-        conditions.append(
-            Event.search.op("@@")(func.websearch_to_tsquery("english", q.strip()))
-        )
-    if category:
-        conditions.append(
-            Event.category_id.in_(select(Category.id).where(Category.slug.in_(category)))
-        )
-    tags = [tag for slug in interest for tag in svc.interest_tags(slug)]
-    if tags:
-        conditions.append(Event.tags.overlap(tags))
-    if format:
-        conditions.append(Event.format == format)
+    `soonest`/`date`, `popular` and `newest` page through every match. `relevance` (personal when
+    signed in) and `deadline` rank the frontend's candidate set (the 80 soonest matches, plus the
+    80 soonest events of organisers whose name matches `q`) and set `truncated` when it was cut.
+    """
+    page_number, page_size = pager
+    now = datetime.now(timezone.utc)
+    text = q.strip()
+    known_interests = {value for value, _ in svc.INTERESTS}
+    conditions = svc.search_filters(
+        categories=category,
+        interests=[value for value in dict.fromkeys(interest) if value in known_interests],
+        formats=list(dict.fromkeys(format)),
+        date_range=date_preset_range(date, now) if date else None,
+        country=country.upper() if country else None,
+        city=clean_location(city or ""),
+    )
     start = _moment(date_from)
     end = _moment(date_to, end=True)
     if start:
         conditions.append(func.coalesce(Event.ends_at, Event.starts_at) >= start)
     if end:
         conditions.append(Event.starts_at <= end)
-    if country:
-        conditions.append(Event.country == country.upper())
-    if city and city.strip():
-        conditions.append(func.lower(Event.city) == city.strip().lower())
+
+    if sort in ("relevance", "deadline"):
+        items, truncated = await svc.search_candidates(db, conditions, text)
+        viewer = await load_viewer(db, user, state=False)
+        ranked = sort_results(rank_events(items, viewer, now, keep_personal=True), sort, now)
+        first = offset(page_number, page_size)
+        return {
+            **svc.page(ranked[first : first + page_size], len(ranked), page_number, page_size),
+            "truncated": truncated,
+        }
+
+    if text:
+        conditions.append(
+            or_(svc.text_match(text), Event.organiser_id.in_(svc.organiser_match(text)))
+        )
+    conditions.append(svc.next_dates_only(conditions))
 
     stmt = svc.card_query().where(*conditions)
     if sort == "popular":
@@ -88,12 +105,12 @@ async def list_events(
             .subquery()
         )
         stmt = stmt.outerjoin(going, going.c.event_id == Event.id).order_by(
-            func.coalesce(going.c.going, 0).desc(), Event.starts_at
+            func.coalesce(going.c.going, 0).desc(), Event.starts_at, Event.id
         )
     elif sort == "newest":
         stmt = stmt.order_by(Event.published_at.desc().nulls_last(), Event.created_at.desc())
     else:
-        stmt = stmt.order_by(Event.starts_at)
+        stmt = stmt.order_by(Event.starts_at, Event.id)
 
     total = await db.scalar(select(func.count()).select_from(Event).where(*conditions)) or 0
     items = await svc.cards(
@@ -107,15 +124,16 @@ async def upcoming_events(
     pager: tuple[int, int] = Depends(pagination),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Published events that have not finished, soonest first."""
+    """Published events that have not finished, soonest first, one card per series."""
     page_number, page_size = pager
     conditions = svc.visible()
+    conditions.append(svc.next_dates_only(conditions))
     total = await db.scalar(select(func.count()).select_from(Event).where(*conditions)) or 0
     items = await svc.cards(
         db,
         svc.card_query()
         .where(*conditions)
-        .order_by(Event.starts_at)
+        .order_by(Event.starts_at, Event.id)
         .limit(page_size)
         .offset(offset(page_number, page_size)),
     )
@@ -123,18 +141,20 @@ async def upcoming_events(
 
 
 @router.get("/happening-soon", response_model=EventPage)
-async def happening_soon(db: AsyncSession = Depends(get_db)) -> dict:
-    """The twelve events starting in the next fourteen days."""
+async def happening_soon(
+    limit: int = Query(12, ge=1, le=40),
+    user: dict | None = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """The soonest events starting in the next fourteen days, one card per series.
+
+    Signed in, each card carries the viewer's `score` and `reason`.
+    """
     now = datetime.now(timezone.utc)
-    conditions = [
-        *svc.visible(),
-        Event.starts_at >= now,
-        Event.starts_at <= now + timedelta(days=14),
-    ]
-    items = await svc.cards(
-        db, svc.card_query().where(*conditions).order_by(Event.starts_at).limit(12)
-    )
-    return svc.page(items, len(items), 1, 12)
+    items = await svc.feed_candidates(db, until=now + timedelta(days=14), limit=40)
+    viewer = await load_viewer(db, user, state=False)
+    ranked = sort_results(rank_events(items, viewer, now, keep_personal=True), "date", now)
+    return svc.page(ranked[:limit], len(ranked[:limit]), 1, limit)
 
 
 @router.get("/counts", response_model=list[EventCountsRow])

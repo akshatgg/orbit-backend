@@ -1,7 +1,7 @@
 """Admin API for event sources, sync runs and the review queue."""
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -35,6 +35,7 @@ from app.sources.service import (
     source_key,
     start_refresh,
 )
+from app.uploads.release import release_images
 
 router = APIRouter(prefix="/admin/sources", tags=["admin:sources"])
 
@@ -763,7 +764,12 @@ async def update_source(
 @router.delete("/{source_id}")
 async def delete_source(
     source_id: UUID,
-    remove_events: bool = Query(False),
+    events: Literal["keep", "remove", "delete"] | None = Query(
+        None,
+        description="What happens to the source's upcoming events: keep them, remove them from "
+        "ORBIT (status removed), or delete them permanently (registrations cascade).",
+    ),
+    remove_events: bool = Query(False, description="Older spelling of events=remove."),
     db: AsyncSession = Depends(get_db),
     admin: dict = Depends(require_admin),
 ) -> dict[str, Any]:
@@ -773,8 +779,11 @@ async def delete_source(
     ).scalar_one_or_none()
     if source is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown source")
+    mode = events or ("remove" if remove_events else "keep")
     removed = 0
-    if remove_events:
+    deleted = 0
+    images = 0
+    if mode == "remove":
         result = await db.execute(
             update(Event)
             .where(
@@ -785,8 +794,26 @@ async def delete_source(
             .values(status="removed", updated_at=_now())
         )
         removed = result.rowcount or 0
+    elif mode == "delete":
+        # As the admin console did: every upcoming event of the source goes, whatever its status;
+        # then the covers nothing else uses are released.
+        covers = (
+            await db.execute(
+                delete(Event)
+                .where(Event.source == source_key(source_id), Event.starts_at >= _now())
+                .returning(Event.cover_url)
+            )
+        ).scalars().all()
+        deleted = len(covers)
+        images = await release_images(db, covers)
     await db.execute(delete(EventSource).where(EventSource.id == source_id))
-    return {"deleted": True, "events_removed": removed}
+    return {
+        "deleted": True,
+        "events": mode,
+        "events_removed": removed,
+        "events_deleted": deleted,
+        "images": images,
+    }
 
 
 @router.post("/{source_id}/enabled")

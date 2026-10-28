@@ -9,7 +9,8 @@ from pydantic import BaseModel, Field
 InteractionKind = Literal["view", "share", "apply_click", "calendar_add"]
 MarkKind = Literal["saved", "dismissed", "external_registered", "attended"]
 EventFormat = Literal["in_person", "online", "hybrid"]
-EventSort = Literal["soonest", "popular", "newest"]
+# soonest and date are the same order; relevance and deadline rank like the frontend's Explore.
+EventSort = Literal["soonest", "date", "popular", "newest", "relevance", "deadline"]
 
 
 class OrganiserBrief(BaseModel):
@@ -72,6 +73,9 @@ class EventCard(BaseModel):
     organiser: OrganiserBrief | None = None
     category: CategoryBrief | None = None
     counts: EventCounts = Field(default_factory=EventCounts)
+    # Set where the list is ranked for the viewer (relevance/deadline search, feeds, happening soon).
+    score: float | None = None
+    reason: str | None = None
 
 
 class EventCountsRow(BaseModel):
@@ -86,6 +90,8 @@ class EventPage(BaseModel):
     total: int
     page: int
     page_size: int
+    # True when a ranked search read only the soonest 80 matches (narrow the search to see more).
+    truncated: bool = False
 
 
 class TicketTypeOut(BaseModel):
