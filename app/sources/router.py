@@ -27,11 +27,11 @@ from app.sources.schemas import (
     SourceUpdate,
 )
 from app.sources.service import (
-    detect_duplicates,
-    refresh_all_sources,
+    detect_duplicates_now,
     run_source,
     source_id_from_key,
     source_key,
+    start_refresh,
 )
 
 router = APIRouter(prefix="/admin/sources", tags=["admin:sources"])
@@ -297,13 +297,11 @@ async def sources_overview(
     }
 
 
-@router.post("/refresh")
-async def refresh_sources(
-    db: AsyncSession = Depends(get_db),
-    admin: dict = Depends(require_admin),
-) -> dict[str, Any]:
-    """Run every enabled source now, then expire past events and detect duplicates."""
-    return await refresh_all_sources(db, "manual")
+@router.post("/refresh", status_code=status.HTTP_202_ACCEPTED)
+async def refresh_sources(admin: dict = Depends(require_admin)) -> dict[str, Any]:
+    """Start a refresh of every enabled source in the background, then expiry and duplicate
+    detection. Each source's result lands in /admin/sources/runs."""
+    return {"started": start_refresh("manual")}
 
 
 @router.get("/runs")
@@ -605,25 +603,12 @@ async def retry_details(
     db: AsyncSession = Depends(get_db),
     admin: dict = Depends(require_admin),
 ) -> dict[str, bool]:
-    """Queue an imported event's page to be read again by the enrichment job."""
+    """Queue an imported event's page to be read again: its details row is deleted, so the
+    next run reads the page straight away."""
     exists = await db.scalar(select(Event.id).where(Event.id == event_id))
     if exists is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "That event no longer exists.")
-    now = _now()
-    await db.execute(
-        pg_insert(SourceEventDetails)
-        .values(
-            event_id=event_id,
-            status="failed",
-            attempts=0,
-            last_error=None,
-            fetched_at=now,
-        )
-        .on_conflict_do_update(
-            index_elements=["event_id"],
-            set_={"status": "failed", "attempts": 0, "last_error": None, "fetched_at": now},
-        )
-    )
+    await db.execute(delete(SourceEventDetails).where(SourceEventDetails.event_id == event_id))
     return {"ok": True}
 
 
@@ -806,7 +791,8 @@ async def run_now(
         raise HTTPException(
             status.HTTP_409_CONFLICT, "Confirm permission to use this feed before running it."
         )
-    summary = await run_source(db, source_id, trigger="manual")
+    await db.commit()  # the run uses its own trusted session; don't hold this transaction open
+    summary = await run_source(source_id, trigger="manual")
     if summary["status"] == "ok":
-        await detect_duplicates(db)
+        await detect_duplicates_now()
     return summary
