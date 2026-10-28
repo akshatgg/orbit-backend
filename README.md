@@ -59,7 +59,7 @@ app/
   admin/               overview, events, users, organisers, categories, CSV
   sources/             feeds, sync engine, review queue, duplicates
   cron/                nightly refresh + daily reminders
-  uploads/             Cloudinary signature, local fallback
+  uploads/             Cloudinary upload signature, image release
   public/              landing, sitemap data, OG data
   connectors/          feed readers (iCal implemented; platform ones pending)
 alembic/versions/0001_baseline.py   the whole schema in one revision
@@ -79,7 +79,7 @@ are replaced, not dropped by accident:
 | `auth.uid()` | reads `app.current_user_id`, set per request |
 | RLS policies | dependency guards in `app/core/deps.py` |
 | `service_role` key | the API connects as one trusted role (`is_service()` → true) |
-| Storage buckets | Cloudinary, with local disk fallback |
+| Storage buckets | Cloudinary (signed direct uploads) |
 | `handle_new_user` trigger | signup creates `users` + `profiles` in one transaction |
 
 Every schema change after the baseline is a normal revision:

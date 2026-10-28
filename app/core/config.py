@@ -45,7 +45,6 @@ class Settings(BaseSettings):
     CLOUDINARY_CLOUD_NAME: Optional[str] = None
     CLOUDINARY_API_KEY: Optional[str] = None
     CLOUDINARY_API_SECRET: Optional[str] = None
-    UPLOAD_DIR: str = "./var/uploads"
     IMAGE_MAX_BYTES: dict = {"event-covers": 5 * 1024 * 1024, "organiser-logos": 2 * 1024 * 1024}
 
     # Web push --------------------------------------------------------------
