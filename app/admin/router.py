@@ -5,7 +5,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status as http_status
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import and_, delete, func, insert, or_, select, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -646,6 +646,24 @@ async def admin_delete_event(
     return {"deleted": True, "registrations": result["registrations"], "images": result["images"]}
 
 
+def _user_type_filter(user_type: str):
+    """The admin "User type" filter (the frontend's typeFilterClause): accounts from before user
+    types existed count as students when they have a university; hosts are a goal, not a type."""
+    if user_type == "host":
+        return Profile.goals.contains(["host"])
+    if user_type == "student":
+        return or_(
+            Profile.user_type == "student",
+            and_(Profile.user_type.is_(None), Profile.university.is_not(None)),
+        )
+    if user_type == "other":
+        return or_(
+            Profile.user_type == "other",
+            and_(Profile.user_type.is_(None), Profile.university.is_(None)),
+        )
+    return Profile.user_type == user_type
+
+
 @router.get("/users")
 async def admin_users(
     q: str | None = None,
@@ -660,7 +678,14 @@ async def admin_users(
     filters = []
     if q and q.strip():
         pattern = f"%{_escape_like(q)}%"
-        filters.append(Profile.full_name.ilike(pattern, escape="\\") | Profile.email.ilike(pattern, escape="\\"))
+        filters.append(
+            or_(
+                *(
+                    column.ilike(pattern, escape="\\")
+                    for column in (Profile.email, Profile.full_name, Profile.university, Profile.course)
+                )
+            )
+        )
     if only == "verified":
         filters.append(Profile.is_verified_student.is_(True))
     elif only == "unverified":
@@ -668,7 +693,7 @@ async def admin_users(
     elif only == "admins":
         filters.append(Profile.role.in_(("admin", "super_admin")))
     if user_type:
-        filters.append(Profile.user_type == user_type)
+        filters.append(_user_type_filter(user_type))
 
     total = int(
         await db.scalar(
@@ -702,6 +727,7 @@ async def admin_users(
             "user_type": profile.user_type,
             "role": profile.role,
             "is_verified_student": profile.is_verified_student,
+            "goals": list(profile.goals or []),
             "onboarded_at": profile.onboarded_at,
             "created_at": profile.created_at,
             "email_verified_at": email_verified_at,
