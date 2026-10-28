@@ -168,6 +168,14 @@ class Event(Base):
             "city",
             postgresql_where=text("status = 'published'"),
         ),
+        # A community's feed: its category's published events in date order (keyset on starts_at, id).
+        Index(
+            "events_feed_idx",
+            "category_id",
+            "starts_at",
+            "id",
+            postgresql_where=text("status = 'published' and duplicate_of is null"),
+        ),
     )
 
 
