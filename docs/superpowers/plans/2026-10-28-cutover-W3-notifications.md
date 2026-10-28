@@ -58,7 +58,8 @@ deduped through `notification_log`, so the frontend can drop
      `notify_event_change`; recipients = active registrations + saved /
      external_registered; kind `event_cancelled` or `event_updated:<fingerprint>`),
    - `notify_organiser_decision(db, organiser_id, decision)` (owners; approved /
-     rejected only; no ledger row because `notification_log.event_id` is required,
+     rejected only; the email always goes, as the frontend sends it, and push
+     follows the push preference; no ledger row because `notification_log.event_id` is required,
      so the caller only notifies when the status actually changes).
    `send_email` (magic links) goes through the same email channel.
 5. Call sites:

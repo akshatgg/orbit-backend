@@ -569,12 +569,13 @@ async def _send_organiser_decision(
     expired: list[str] = []
     emails: dict[str, None] = {}
     for user_id in owners:
-        channels = channels_for(user_id, recipients.prefs(user_id), recipients, available)
-        if "push" in channels:
+        # Push follows the owner's push preference.
+        if "push" in channels_for(user_id, recipients.prefs(user_id), recipients, available):
             sent = await send_push(recipients.subscriptions.get(user_id, []), message)
             expired.extend(sent.expired_endpoints)
             pushed += sent.delivered > 0
-        if "email" in channels:
+        # The email is a transactional account notice: always sent, as the frontend does.
+        if available["email"] and user_id in recipients.emails:
             emails[recipients.emails[user_id]] = None
     await delete_subscriptions(db, expired)
     rendered = render_email(message, app_url())
@@ -594,6 +595,9 @@ async def notify_organiser_decision(
     db: AsyncSession, organiser_id: UUID | str, decision: str
 ) -> None:
     """An admin approved or rejected an organisation: tell its owners. Other decisions are silent.
+
+    Owners always get the email (an account notice, whatever their email preference);
+    push follows their push preference.
 
     There is no ledger row (notification_log needs an event), so call this only when
     the status actually changed.
