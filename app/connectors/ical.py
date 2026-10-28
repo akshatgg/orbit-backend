@@ -1,558 +1,570 @@
-"""iCal (RFC 5545) feeds → normalised events, with recurring events expanded.
+"""iCal (RFC 5545) → normalised events (port of `src/lib/sources/ical.ts`).
 
-Uses `icalendar` for parsing and `dateutil.rrule` for recurrence expansion (no
-`recurring_ical_events` dependency). One event id per occurrence: `uid#20261020T180000Z`.
-Events that have ended, or start beyond 120 days, are dropped; upstream CANCELLED
-status is carried through as `cancelled=True` for the sync engine to flag.
+The TypeScript engine parses feeds with ical.js; this follows its rules with `icalendar`
+for the parsing and `dateutil` for RRULE expansion:
+
+- A time is *resolved* (an absolute instant) when it is UTC (`Z`, or TZID UTC/GMT/Z) or
+  its TZID has a VTIMEZONE in the feed. Any other time is floating and is read in the
+  event's zone (its TZID when that is an IANA name, else the calendar's) with the literal
+  `zoned_time_to_utc`; all-day dates likewise.
+- One-off events are kept until they end and up to `horizon_days` ahead; recurring
+  events are expanded `recurrence_days` ahead, at most `max_occurrences` dates each.
+- Occurrence ids are `uid#<key>`: `YYYYMMDDTHHMMSSZ` for resolved times, the local
+  `YYYYMMDDTHHMMSS` for floating ones, `YYYYMMDD` for all-day dates. A feed without UIDs
+  gets `nouid-<FNV-1a base36 of summary|dtstart>`.
 """
 
-import hashlib
-import html
+import calendar as calendar_lib
 import re
-from datetime import date, datetime, time, timedelta, timezone
-from typing import Any
-from urllib.parse import urlparse
+import warnings
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone, tzinfo
+from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
-import httpx
 from dateutil.rrule import rrulestr
 from icalendar import Calendar
 
-from app.core.config import settings
-
+from . import fetch as http
+from . import js, platforms
 from .base import ConnectorError, FetchedFeed
+from .text import LIMITS, clamp, clean_prose, one_line, or_null, safe_http_url, strip_html, summarise
+from .timezone import DEFAULT_TIMEZONE, canonical, is_valid_timezone, zoned_time_to_utc
 
-HORIZON_DAYS = 120
-MAX_EVENTS = 2000
-MAX_OCCURRENCES = 500
+ICAL_DEFAULTS = {"recurrence_days": 60, "max_occurrences": 30, "horizon_days": 365, "max_events": 2000}
+
+# Safety net for rules like FREQ=MINUTELY that started years ago.
 MAX_ITERATIONS = 20000
-TITLE_MAX = 140
-SUMMARY_MAX = 200
-DESCRIPTION_MAX = 10000
-TIMEOUT_SECONDS = 15.0
-MAX_BYTES = 5 * 1024 * 1024
-USER_AGENT = "Orbit event sync (+https://orbit.example)"
+DAY = 24 * 60 * 60 * 1000
 
-ONLINE_HINT = re.compile(r"\b(online|virtual|zoom|teams|google meet|webinar)\b", re.I)
-SCRIPT_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.I | re.S)
-COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
-BREAK_RE = re.compile(r"<br\s*/?>", re.I)
-BLOCK_END_RE = re.compile(r"</(p|div|li|h[1-6]|tr)>", re.I)
-TAG_RE = re.compile(r"<[^>]+>")
-SPACE_RE = re.compile(r"[ \t\f\v]+")
-BLANK_LINES_RE = re.compile(r"\n{3,}")
+_UTC_IDS = {"Z", "UTC", "GMT"}
+_VALUE = re.compile(r"^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?$")
 
 
-def _zone(name: str | None) -> ZoneInfo:
-    if name:
-        try:
-            return ZoneInfo(name)
-        except Exception:
-            pass
-    return ZoneInfo(settings.DEFAULT_TIMEZONE)
+@dataclass(frozen=True)
+class ITime:
+    """An ical.js `Time`: wall-clock fields plus how its zone was resolved."""
+
+    wall: datetime  # naive
+    is_date: bool
+    kind: str  # "utc" | "zone" (a VTIMEZONE in the feed) | "floating"
+    tz: tzinfo | None = None
+
+    @property
+    def resolved(self) -> bool:
+        return self.kind in ("utc", "zone")
+
+    def unix_ms(self) -> int:
+        """`toUnixTime()`: floating times count as UTC."""
+        if self.kind == "zone" and self.tz is not None:
+            return js.to_ms(_localize(self.wall, self.tz))
+        return calendar_lib.timegm(self.wall.timetuple()) * 1000
+
+    def to_string(self) -> str:
+        w = self.wall
+        if self.is_date:
+            return f"{w.year}-{w.month:02d}-{w.day:02d}"
+        out = f"{w.year}-{w.month:02d}-{w.day:02d}T{w.hour:02d}:{w.minute:02d}:{w.second:02d}"
+        return out + ("Z" if self.kind == "utc" else "")
+
+    def ical_string(self) -> str:
+        return self.to_string().replace("-", "").replace(":", "")
+
+    def to_utc(self) -> "ITime":
+        """`convertToZone(utcTimezone)`: a floating time keeps its wall clock."""
+        if self.kind == "zone" and self.tz is not None:
+            moment = js.from_ms(self.unix_ms()).replace(tzinfo=None)
+            return ITime(moment, self.is_date, "utc")
+        return ITime(self.wall, self.is_date, "utc")
+
+    def plus(self, delta: timedelta) -> "ITime":
+        return replace(self, wall=self.wall + delta)
 
 
-def _valid_zone(name: Any) -> str | None:
-    if not isinstance(name, str) or not name:
-        return None
-    try:
-        ZoneInfo(name)
-        return name
-    except Exception:
-        return None
+def _localize(wall: datetime, tz: tzinfo) -> datetime:
+    localize = getattr(tz, "localize", None)  # pytz-style zones
+    return localize(wall) if localize else wall.replace(tzinfo=tz)
 
 
-def _as_utc(value: datetime, tz: ZoneInfo) -> datetime:
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=tz)
-    return value.astimezone(timezone.utc)
+def _first(component: Any, name: str) -> Any:
+    value = component.get(name)
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
 
 
-def _iso(value: datetime | None) -> str | None:
+def _text_prop(component: Any, name: str) -> str | None:
+    value = _first(component, name)
     if value is None:
         return None
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return str(value) if isinstance(value, str) else _as_text(value)
 
 
-def _decoded(component: Any, name: str) -> Any:
-    prop = component.get(name)
-    if prop is None:
-        return None
-    value = getattr(prop, "dt", prop)
-    return value
-
-
-def _datetime_prop(component: Any, name: str) -> tuple[datetime, bool] | None:
-    value = _decoded(component, name)
-    if isinstance(value, datetime):
-        return value, False
-    if isinstance(value, date):
-        return datetime.combine(value, time.min), True
-    return None
-
-
-def _tzid(component: Any, name: str = "DTSTART") -> str | None:
-    prop = component.get(name)
-    if prop is None:
-        return None
-    params = getattr(prop, "params", {}) or {}
-    raw = params.get("TZID")
-    if isinstance(raw, (list, tuple)):
-        raw = raw[0] if raw else None
-    if not isinstance(raw, str):
-        return None
-    if _valid_zone(raw):
-        return raw
-    # Some producers prefix IANA names: "/mozilla.org/20050126_1/Europe/London".
-    tail = "/".join(raw.split("/")[-2:])
-    return _valid_zone(tail)
-
-
-def _one_line(value: Any) -> str:
-    return SPACE_RE.sub(" ", str(value or "").replace("\r", " ").replace("\n", " ")).strip()
-
-
-def _clamp(value: str, limit: int) -> str:
-    return value[:limit].strip()
-
-
-def _strip_html(value: str | None) -> str:
-    if not value:
-        return ""
-    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
-    text = SCRIPT_RE.sub("", text)
-    text = COMMENT_RE.sub("", text)
-    text = BREAK_RE.sub("\n", text)
-    text = BLOCK_END_RE.sub("\n", text)
-    text = TAG_RE.sub("", text)
-    text = html.unescape(text)
-    text = SPACE_RE.sub(" ", text)
-    text = "\n".join(line.strip() for line in text.split("\n"))
-    return BLANK_LINES_RE.sub("\n\n", text).strip()
-
-
-def _http_url(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    value = value.strip()
-    if len(value) > 2000 or not re.match(r"^https?://\S+\.\S+", value, re.I):
-        return None
-    return value
-
-
-def _geo(component: Any) -> tuple[float | None, float | None]:
-    value = _decoded(component, "GEO")
-    pair: list[Any] = []
-    if isinstance(value, (list, tuple)):
-        pair = list(value)
-    elif isinstance(value, str):
-        pair = re.split(r"[;,]", value)
-    elif hasattr(value, "latitude"):
-        pair = [getattr(value, "latitude", None), getattr(value, "longitude", None)]
+def _as_text(value: Any) -> str | None:
     try:
-        latitude = float(pair[0])
-        longitude = float(pair[1])
-    except (IndexError, TypeError, ValueError):
+        raw = value.to_ical()
+    except Exception:  # noqa: BLE001
+        return None
+    return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+
+
+def _param(prop: Any, name: str) -> Any:
+    params = getattr(prop, "params", None) or {}
+    value = params.get(name)
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
+
+
+class _Zones:
+    """The calendar's VTIMEZONEs by TZID (ical.js getTimeZoneByID)."""
+
+    def __init__(self, cal: Any) -> None:
+        self.components = {}
+        for sub in cal.subcomponents:
+            if sub.name == "VTIMEZONE":
+                tzid = _text_prop(sub, "TZID")
+                if tzid is not None and tzid not in self.components:
+                    self.components[tzid] = sub
+        self._cache: dict[str, tzinfo | None] = {}
+
+    def get(self, tzid: str) -> tzinfo | None:
+        if tzid not in self.components:
+            return None
+        if tzid not in self._cache:
+            name = canonical(tzid)
+            zone: tzinfo | None = None
+            if name:
+                zone = ZoneInfo(name)
+            else:
+                try:
+                    zone = self.components[tzid].to_tz()
+                except Exception:  # noqa: BLE001 - an unusable definition reads as UTC
+                    zone = timezone.utc
+            self._cache[tzid] = zone
+        return self._cache[tzid]
+
+
+def _parse_value(raw: str, tzid: Any, zones: _Zones) -> ITime | None:
+    match = _VALUE.match(raw.strip())
+    if not match:
+        return None
+    y, mo, d, h, mi, s, z = match.groups()
+    try:
+        if h is None:
+            return ITime(datetime(int(y), int(mo), int(d)), True, "floating")
+        wall = datetime(int(y), int(mo), int(d), int(h), int(mi), int(s))
+    except ValueError:
+        return None
+    if z:
+        return ITime(wall, False, "utc")
+    if isinstance(tzid, str) and tzid:
+        zone = zones.get(tzid)
+        if zone is not None:
+            return ITime(wall, False, "zone", zone)
+        if tzid in _UTC_IDS:
+            return ITime(wall, False, "utc")
+    return ITime(wall, False, "floating")
+
+
+def _time_prop(component: Any, name: str, zones: _Zones) -> ITime | None:
+    prop = _first(component, name)
+    if prop is None:
+        return None
+    raw = _as_text(prop)
+    return _parse_value(raw, _param(prop, "TZID"), zones) if raw is not None else None
+
+
+def _time_list(component: Any, name: str, zones: _Zones) -> list[ITime]:
+    value = component.get(name)
+    if value is None:
+        return []
+    out: list[ITime] = []
+    for block in value if isinstance(value, list) else [value]:
+        tzid = _param(block, "TZID")
+        for item in getattr(block, "dts", []) or []:
+            raw = _as_text(item)
+            if raw is None:
+                continue
+            parsed = _parse_value(raw.split("/")[0], tzid, zones)  # a PERIOD counts from its start
+            if parsed is not None:
+                out.append(parsed)
+    return out
+
+
+def _duration_prop(component: Any) -> timedelta | None:
+    prop = _first(component, "DURATION")
+    value = getattr(prop, "dt", None) if prop is not None else None
+    return value if isinstance(value, timedelta) else None
+
+
+def _end_date(component: Any, start: ITime, zones: _Zones) -> ITime:
+    """ical.js `Event.endDate`: DTEND, else DTSTART + DURATION, else DTSTART (+1 day if all-day)."""
+    end = _time_prop(component, "DTEND", zones)
+    if end is not None:
+        return end
+    duration = _duration_prop(component)
+    if duration is not None:
+        return start.plus(duration)
+    return start.plus(timedelta(days=1)) if start.is_date else start
+
+
+def _to_instant(t: ITime, tz: str) -> int | None:
+    w = t.wall
+    if t.is_date:
+        return zoned_time_to_utc(w.year, w.month, w.day, tz=tz)
+    if t.resolved:
+        return t.unix_ms()
+    return zoned_time_to_utc(w.year, w.month, w.day, w.hour, w.minute, w.second, tz=tz)
+
+
+def _event_timezone(component: Any, calendar_tz: str) -> str:
+    """The zone this event was written in: its TZID if we know it, else the calendar's."""
+    prop = _first(component, "DTSTART")
+    raw = _param(prop, "TZID") if prop is not None else None
+    if isinstance(raw, str):
+        if is_valid_timezone(raw):
+            return raw
+        # Some producers prefix IANA names, e.g. "/mozilla.org/20050126_1/Europe/London".
+        tail = "/".join(raw.split("/")[-2:])
+        if is_valid_timezone(tail):
+            return tail
+    return calendar_tz
+
+
+_ONLINE_HINT = re.compile(r"\b(online|virtual|zoom|teams|google meet|webinar)\b", re.IGNORECASE | re.ASCII)
+_ONLINE_NAME = re.compile(r"^(online|virtual|zoom|microsoft teams|teams|google meet)$", re.IGNORECASE | re.ASCII)
+_LINK = re.compile(r"^https?://", re.IGNORECASE | re.ASCII)
+
+
+def _split_location(location: str | None) -> tuple[str | None, str | None, str]:
+    text = one_line(location)
+    if not text:
+        return None, None, "in_person"
+    # A bare link (often a meeting URL): never publish it; just mark the event as online.
+    if _LINK.match(text) or _ONLINE_NAME.match(text):
+        return "Online", None, "online"
+    comma = text.find(",")
+    venue = js.trim(text[:comma]) if comma > 0 else text
+    address = js.trim(text[comma + 1 :]) if comma > 0 else ""
+    online = bool(_ONLINE_HINT.search(text)) and comma < 0
+    return (
+        or_null(clamp(venue, LIMITS["venue"])),
+        or_null(clamp(address, LIMITS["address"])),
+        "online" if online else "in_person",
+    )
+
+
+def stable_hash(value: str) -> str:
+    """FNV-1a over UTF-16 code units, in base 36 (used only when a feed omits UIDs)."""
+    h = 0x811C9DC5
+    data = value.encode("utf-16-le", "surrogatepass")
+    for i in range(0, len(data), 2):
+        h ^= data[i] | (data[i + 1] << 8)
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    while True:
+        h, rem = divmod(h, 36)
+        out = digits[rem] + out
+        if h == 0:
+            return out
+
+
+def _geo_point(component: Any) -> tuple[float | None, float | None]:
+    """GEO is a structured `lat;lon` value. Missing or nonsensical points are dropped."""
+    prop = _first(component, "GEO")
+    if prop is None:
         return None, None
-    if abs(latitude) > 90 or abs(longitude) > 180:
+    if hasattr(prop, "latitude") and hasattr(prop, "longitude"):
+        pair: list[Any] = [prop.latitude, prop.longitude]
+    else:
+        pair = re.split(r"[;,]", _as_text(prop) or "")
+    if len(pair) < 2:
+        return None, None
+    latitude, longitude = js.number(pair[0]), js.number(pair[1])
+    if not js.finite(latitude) or not js.finite(longitude) or abs(latitude) > 90 or abs(longitude) > 180:
         return None, None
     return latitude, longitude
 
 
-def _location(value: str | None) -> tuple[str | None, str | None, str]:
-    text = _one_line(value)
-    if not text:
-        return None, None, "in_person"
-    if re.match(r"^https?://", text, re.I) or re.match(
-        r"^(online|virtual|zoom|microsoft teams|teams|google meet)$", text, re.I
-    ):
-        return "Online", None, "online"
-    comma = text.find(",")
-    if comma > 0:
-        venue = _clamp(text[:comma], 200) or None
-        address = _clamp(text[comma + 1 :], 300) or None
-        return venue, address, "in_person"
-    online = bool(ONLINE_HINT.search(text)) and comma < 0
-    return _clamp(text, 200) or None, None, "online" if online else "in_person"
+def _base_uid(component: Any) -> str:
+    uid = _text_prop(component, "UID")
+    uid = js.trim(uid) if uid is not None else ""
+    if uid:
+        return js.u16slice(uid, 400)
+    start = _first(component, "DTSTART")
+    start_text = ""
+    if start is not None:
+        raw = _as_text(start)
+        parsed = _parse_value(raw, _param(start, "TZID"), _NO_ZONES) if raw else None
+        start_text = parsed.to_string() if parsed else ""
+    summary = _text_prop(component, "SUMMARY") or ""
+    return f"nouid-{stable_hash(f'{summary}|{start_text}')}"
 
 
-def _occurrence_key(value: datetime | date) -> str:
-    if isinstance(value, datetime):
-        utc = value.astimezone(timezone.utc) if value.tzinfo else value
-        return utc.strftime("%Y%m%dT%H%M%SZ")
-    return value.strftime("%Y%m%d")
+def _occurrence_key(t: ITime) -> str:
+    """iCal-style key for an occurrence, e.g. "20261020T180000Z" or "20261020" for all-day."""
+    return (t.to_utc() if t.resolved and not t.is_date else t).ical_string()
 
 
-def _rule_label(rule: Any) -> str | None:
-    freq = rule.get("FREQ") if rule is not None else None
-    values = freq if isinstance(freq, (list, tuple)) else [freq]
-    key = str(values[0]).upper() if values and values[0] is not None else ""
-    return {
-        "DAILY": "Repeats daily",
-        "WEEKLY": "Repeats weekly",
-        "MONTHLY": "Repeats monthly",
-        "YEARLY": "Repeats yearly",
-    }.get(key)
+def _normalise(
+    component: Any, start: ITime, end: ITime | None, source_event_id: str, calendar_tz: str
+) -> dict[str, Any]:
+    title = clamp(one_line(_text_prop(component, "SUMMARY")), LIMITS["title"])
+    if js.u16len(title) < 3:
+        return {"event": source_event_id, "message": "Skipped: title is missing or too short"}
 
+    tz = _event_timezone(component, calendar_tz)
+    all_day = start.is_date
+    starts = _to_instant(start, tz)
+    ends = _to_instant(end, tz) if end is not None else None
+    if all_day and ends is not None:
+        ends -= 60 * 1000  # DTEND is exclusive → 23:59 of the last day
+    if ends is not None and (starts is None or ends <= starts):
+        ends = starts + DAY - 60000 if all_day and starts is not None else None
+    if starts is None:
+        return {"event": source_event_id, "message": "Skipped: invalid start date"}
 
-def _build_event(
-    component: Any,
-    *,
-    uid: str,
-    source_event_id: str,
-    start: datetime,
-    end: datetime | None,
-    all_day: bool,
-    tz_name: str,
-    cancelled: bool,
-    series_key: str | None,
-    series_label: str | None,
-) -> dict[str, Any] | None:
-    title = _clamp(_one_line(_decoded(component, "SUMMARY")), TITLE_MAX)
-    if len(title) < 3:
-        return None
-    description = _strip_html(_decoded(component, "DESCRIPTION"))
-    summary = _clamp(_one_line(description), SUMMARY_MAX) or None
-    venue, address, fmt = _location(_decoded(component, "LOCATION"))
-    latitude, longitude = _geo(component)
-    url = _http_url(_decoded(component, "URL"))
+    description = or_null(
+        clamp(clean_prose(strip_html(_text_prop(component, "DESCRIPTION")), keep_emphasis=True), LIMITS["description"])
+    )
+    venue_name, address, fmt = _split_location(_text_prop(component, "LOCATION"))
+    latitude, longitude = _geo_point(component)
+    status = _text_prop(component, "STATUS")
+
     return {
         "source_event_id": source_event_id,
         "title": title,
-        "summary": summary,
-        "description": _clamp(description, DESCRIPTION_MAX) or None,
-        "starts_at": _iso(start),
-        "ends_at": _iso(end),
-        "timezone": tz_name,
+        "summary": summarise(description),
+        "description": description,
+        "starts_at": js.iso(starts),
+        "ends_at": js.iso(ends) if ends is not None else None,
+        "all_day": all_day,
+        "timezone": tz,
         "format": fmt,
-        "venue_name": venue,
+        "venue_name": venue_name,
         "address": address,
         "city": None,
-        "country": None,
         "latitude": latitude,
         "longitude": longitude,
-        "url": url,
-        "cover_url": None,
-        "price_min": None,
-        "price_max": None,
-        "currency": None,
-        "cancelled": cancelled,
-        "tags": [],
-        "series_key": series_key,
-        "series_label": series_label,
-        "interest_labels": [],
+        "url": safe_http_url(_text_prop(component, "URL")),
+        "cancelled": (status or "").upper() == "CANCELLED",
     }
 
 
-def _exdates(component: Any, tz: ZoneInfo) -> set[str]:
-    out: set[str] = set()
-    raw = component.get("EXDATE")
-    if raw is None:
-        return out
-    blocks = raw if isinstance(raw, list) else [raw]
-    for block in blocks:
-        for item in getattr(block, "dts", []) or []:
-            value = getattr(item, "dt", None)
-            if isinstance(value, datetime):
-                out.add(_occurrence_key(_as_utc(value, tz)))
-            elif isinstance(value, date):
-                out.add(_occurrence_key(value))
-    return out
+class _NoZones(_Zones):
+    def __init__(self) -> None:
+        self.components = {}
+        self._cache = {}
 
 
-def _rdates(component: Any, tz: ZoneInfo) -> list[datetime]:
-    out: list[datetime] = []
-    raw = component.get("RDATE")
-    if raw is None:
-        return out
-    blocks = raw if isinstance(raw, list) else [raw]
-    for block in blocks:
-        for item in getattr(block, "dts", []) or []:
-            value = getattr(item, "dt", None)
-            if isinstance(value, datetime):
-                out.append(_as_utc(value, tz))
-            elif isinstance(value, date):
-                out.append(_as_utc(datetime.combine(value, time.min), tz))
-    return out
+_NO_ZONES = _NoZones()
+
+_UNTIL = re.compile(r"(^|;)UNTIL=([^;]*)", re.IGNORECASE)
 
 
-def _calendar_zone(calendar: Any) -> str:
-    wr_tz = _decoded(calendar, "X-WR-TIMEZONE")
-    return _valid_zone(wr_tz) or _valid_zone(settings.DEFAULT_TIMEZONE) or "Europe/London"
+def _rule_times(rule_text: str, dtstart: ITime, zones: _Zones) -> Iterator[ITime]:
+    """One RRULE's occurrences from DTSTART, in DTSTART's zone; UNTIL compared as ical.js does."""
+    until: ITime | None = None
+    match = _UNTIL.search(rule_text)
+    if match:
+        until = _parse_value(match.group(2), None, zones)
+        rule_text = _UNTIL.sub("", rule_text).lstrip(";")
+    rule = rrulestr(rule_text, dtstart=dtstart.wall)
+    for wall in rule:
+        occurrence = ITime(wall, dtstart.is_date, dtstart.kind, dtstart.tz)
+        if until is not None and occurrence.unix_ms() > until.unix_ms():
+            return
+        yield occurrence
 
 
-def parse_ical(text: str, now: datetime) -> FetchedFeed:
-    """Parse iCal text into events, expanding recurrences over the next 120 days."""
-    if "BEGIN:VCALENDAR" not in text.upper():
+def _expansion(component: Any, dtstart: ITime, zones: _Zones) -> Iterator[ITime]:
+    """ical.js RecurExpansion: RRULE dates and RDATEs merged in order, EXDATEs removed."""
+    iterators = []
+    rules = component.get("RRULE")
+    for prop in rules if isinstance(rules, list) else [rules]:
+        if prop is not None:
+            iterators.append(_rule_times(_as_text(prop) or "", dtstart, zones))
+    heads: list[ITime | None] = [next(it, None) for it in iterators]
+
+    # Every RDATE counts (ical.js keeps them all once the first precedes DTSTART, and the
+    # rest are after it anyway).
+    rdates = sorted(_time_list(component, "RDATE", zones), key=lambda t: t.unix_ms())
+    exdates = _time_list(component, "EXDATE", zones)
+    ex_times = {t.unix_ms() for t in exdates if not t.is_date}
+    ex_dates = {t.unix_ms() for t in exdates if t.is_date}
+    ex_days = {t.wall.date() for t in exdates if t.is_date}
+
+    def excluded(t: ITime) -> bool:
+        # A DATE EXDATE removes every time on that day (ical.js _compare_special).
+        if t.is_date:
+            return t.unix_ms() in ex_times or t.unix_ms() in ex_dates
+        return t.wall.date() in ex_days or t.unix_ms() in ex_times
+
+    r = 0
+    while True:
+        live = [(h.unix_ms(), i) for i, h in enumerate(heads) if h is not None]
+        rdate = rdates[r] if r < len(rdates) else None
+        if rdate is None and not live:
+            return
+        if live:
+            best_ms, best = min(live)
+        if rdate is not None and (not live or rdate.unix_ms() <= best_ms):
+            occurrence = rdate
+            r += 1
+        else:
+            occurrence = heads[best]  # type: ignore[assignment]
+            heads[best] = next(iterators[best], None)
+        if excluded(occurrence):
+            continue
+        yield occurrence
+
+
+def parse_ical(
+    text: str,
+    now: datetime,
+    *,
+    default_timezone: str | None = None,
+    recurrence_days: int = 60,
+    max_occurrences: int = 30,
+    horizon_days: int = 365,
+    max_events: int = 2000,
+) -> FetchedFeed:
+    """Parses an iCal feed. Throws when the text isn't iCal at all."""
+    now_ms = js.to_ms(now)
+    single_horizon = now_ms + horizon_days * DAY
+    recurrence_end = now_ms + recurrence_days * DAY
+
+    if not re.search("BEGIN:VCALENDAR", text, re.IGNORECASE):
         raise ConnectorError("This doesn't look like an iCal feed (no BEGIN:VCALENDAR).")
     try:
-        calendar = Calendar.from_ical(text)
+        with warnings.catch_warnings():
+            # icalendar warns when it guesses a vendor-prefixed TZID; the guess is what we want.
+            warnings.simplefilter("ignore")
+            cal = Calendar.from_ical(text)
     except Exception as exc:  # noqa: BLE001 - surface the parser's reason to the admin
         raise ConnectorError(f"Couldn't read the iCal feed: {exc}") from exc
 
-    now = now.astimezone(timezone.utc)
-    horizon = now + timedelta(days=HORIZON_DAYS)
-    calendar_tz = _calendar_zone(calendar)
-
-    masters: dict[str, Any] = {}
-    exceptions: dict[str, dict[str, Any]] = {}
-    for component in calendar.walk("VEVENT"):
-        uid = _one_line(_decoded(component, "UID"))[:400]
-        if not uid:
-            start = _datetime_prop(component, "DTSTART")
-            seed = f"{_one_line(_decoded(component, 'SUMMARY'))}|{start[0] if start else ''}"
-            uid = "nouid-" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
-        recurrence_id = _datetime_prop(component, "RECURRENCE-ID")
-        if recurrence_id:
-            zone = _zone(_tzid(component) or calendar_tz)
-            key = _occurrence_key(_as_utc(recurrence_id[0], zone))
-            exceptions.setdefault(uid, {})[key] = component
-        elif uid not in masters:
-            masters[uid] = component
+    zones = _Zones(cal)
+    wr_tz = _text_prop(cal, "X-WR-TIMEZONE")
+    if is_valid_timezone(wr_tz):
+        calendar_tz = wr_tz
+    elif is_valid_timezone(default_timezone):
+        calendar_tz = default_timezone
+    else:
+        calendar_tz = DEFAULT_TIMEZONE
 
     events: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    def push(event: dict[str, Any] | None, ref: str) -> None:
-        if event is None:
-            errors.append({"event": ref, "message": "Skipped: title is missing or too short"})
+    def push(result: dict[str, Any]) -> None:
+        if "message" in result:
+            errors.append(result)
             return
-        if len(events) >= MAX_EVENTS:
+        if result["source_event_id"] in seen:
             return
-        if event["source_event_id"] in seen:
-            return
-        seen.add(event["source_event_id"])
-        events.append(event)
+        seen.add(result["source_event_id"])
+        events.append(result)
+
+    # Group VEVENTs: masters by UID, and their modified occurrences (RECURRENCE-ID).
+    masters: dict[str, Any] = {}
+    exceptions: dict[str, list[Any]] = {}
+    for vevent in (c for c in cal.subcomponents if c.name == "VEVENT"):
+        uid = _base_uid(vevent)
+        if vevent.get("RECURRENCE-ID") is not None:
+            exceptions.setdefault(uid, []).append(vevent)
+        elif uid not in masters:
+            masters[uid] = vevent
+
+    def keep_one_off(start_ms: int | None, end_ms: int | None) -> bool:
+        if start_ms is None or end_ms is None:
+            return True  # NaN comparisons are false in JS
+        return not (max(start_ms, end_ms) < now_ms or start_ms > single_horizon)
 
     for uid, component in masters.items():
-        if len(events) >= MAX_EVENTS:
+        if len(events) >= max_events:
             break
         try:
-            start_prop = _datetime_prop(component, "DTSTART")
-            if start_prop is None:
+            related: dict[str, Any] = {}
+            for exception in exceptions.pop(uid, []):
+                recurrence_id = _time_prop(exception, "RECURRENCE-ID", zones)
+                if recurrence_id is None:
+                    raise ValueError("invalid recurrence-id")
+                related[recurrence_id.to_string()] = exception
+            start = _time_prop(component, "DTSTART", zones)
+            if start is None:
                 errors.append({"event": uid, "message": "Skipped: no start date"})
                 continue
-            tz_name = _tzid(component) or calendar_tz
-            tz = _zone(tz_name)
-            start_raw, all_day = start_prop
-            start_utc = _as_utc(start_raw, tz)
+            tz = _event_timezone(component, calendar_tz)
+            end = _end_date(component, start, zones)
 
-            end_raw: datetime | None = None
-            end_prop = _datetime_prop(component, "DTEND")
-            if end_prop:
-                end_raw = end_prop[0]
-            else:
-                duration = _decoded(component, "DURATION")
-                if isinstance(duration, timedelta):
-                    end_raw = start_raw + duration
-            end_utc = _as_utc(end_raw, tz) if end_raw else None
-            if all_day and end_utc:
-                end_utc = end_utc - timedelta(minutes=1)
-            if end_utc and end_utc <= start_utc:
-                end_utc = start_utc + timedelta(days=1) - timedelta(minutes=1) if all_day else None
-
-            duration = (end_utc - start_utc) if end_utc else timedelta(0)
-            rule_prop = component.get("RRULE")
-            status = _one_line(_decoded(component, "STATUS")).upper()
-            cancelled = status == "CANCELLED"
-
-            if rule_prop is None:
-                if max(start_utc, end_utc or start_utc) < now or start_utc > horizon:
+            if component.get("RRULE") is None and component.get("RDATE") is None:
+                if not keep_one_off(_to_instant(start, tz), _to_instant(end, tz)):
                     continue
-                push(
-                    _build_event(
-                        component,
-                        uid=uid,
-                        source_event_id=uid,
-                        start=start_utc,
-                        end=end_utc,
-                        all_day=all_day,
-                        tz_name=tz_name,
-                        cancelled=cancelled,
-                        series_key=None,
-                        series_label=None,
-                    ),
-                    uid,
-                )
+                push(_normalise(component, start, end, uid, calendar_tz))
                 continue
 
-            series_label = _rule_label(rule_prop)
-            rule_dtstart = start_raw if start_raw.tzinfo else start_raw.replace(tzinfo=tz)
-            try:
-                rule = rrulestr(rule_prop.to_ical().decode(), dtstart=rule_dtstart)
-            except Exception as exc:  # noqa: BLE001 - one bad rule shouldn't fail the feed
-                errors.append({"event": uid, "message": f"Skipped recurring event: {exc}"})
-                continue
-
-            exdates = _exdates(component, tz)
-            extra_rdates = _rdates(component, tz)
-            window_start = now - duration
-            occurrences: list[datetime] = []
-            try:
-                for index, occurrence in enumerate(rule.xafter(window_start, inc=True)):
-                    if index >= MAX_ITERATIONS or occurrence > horizon:
-                        break
-                    occurrences.append(occurrence.astimezone(timezone.utc) if occurrence.tzinfo else _as_utc(occurrence, tz))
-            except Exception as exc:  # noqa: BLE001
-                errors.append({"event": uid, "message": f"Skipped recurring event: {exc}"})
-                continue
-            occurrences.extend(extra_rdates)
-            occurrences.sort()
-
+            duration = _duration_prop(component)
+            if duration is None:
+                duration = timedelta(milliseconds=end.unix_ms() - start.unix_ms())
             kept = 0
-            used_exceptions: set[str] = set()
-            for occurrence_start in occurrences:
-                if kept >= MAX_OCCURRENCES or len(events) >= MAX_EVENTS:
+            for i, occurrence in enumerate(_expansion(component, start, zones)):
+                if i >= MAX_ITERATIONS:
                     break
-                key = _occurrence_key(occurrence_start)
-                if key in exdates:
-                    continue
-                occurrence_end = occurrence_start + duration
-                if max(occurrence_start, occurrence_end) < now or occurrence_start > horizon:
-                    continue
-                occurrence_id = f"{uid}#{key}"
-                override = exceptions.get(uid, {}).get(key)
-                if override is not None:
-                    used_exceptions.add(key)
-                    over_start_prop = _datetime_prop(override, "DTSTART")
-                    over_end_prop = _datetime_prop(override, "DTEND")
-                    over_tz_name = _tzid(override) or tz_name
-                    over_tz = _zone(over_tz_name)
-                    over_start = (
-                        _as_utc(over_start_prop[0], over_tz) if over_start_prop else occurrence_start
-                    )
-                    over_end = _as_utc(over_end_prop[0], over_tz) if over_end_prop else over_start + duration
-                    over_status = _one_line(_decoded(override, "STATUS")).upper()
-                    push(
-                        _build_event(
-                            override,
-                            uid=uid,
-                            source_event_id=occurrence_id,
-                            start=over_start,
-                            end=over_end,
-                            all_day=all_day,
-                            tz_name=over_tz_name,
-                            cancelled=over_status == "CANCELLED",
-                            series_key=uid,
-                            series_label=series_label,
-                        ),
-                        occurrence_id,
-                    )
+                occurrence_start = _to_instant(occurrence, tz)
+                if occurrence_start is not None and occurrence_start > recurrence_end:
+                    break
+                exception = related.get(occurrence.to_string()) or related.get(occurrence.to_utc().to_string())
+                if exception is not None:
+                    item = exception
+                    item_start = _time_prop(exception, "DTSTART", zones)
+                    if item_start is None:
+                        raise ValueError("exception without a start")
+                    item_end = _end_date(exception, item_start, zones)
                 else:
-                    push(
-                        _build_event(
-                            component,
-                            uid=uid,
-                            source_event_id=occurrence_id,
-                            start=occurrence_start,
-                            end=occurrence_end,
-                            all_day=all_day,
-                            tz_name=tz_name,
-                            cancelled=cancelled,
-                            series_key=uid,
-                            series_label=series_label,
-                        ),
-                        occurrence_id,
-                    )
+                    item, item_start, item_end = component, occurrence, occurrence.plus(duration)
+                end_ms = _to_instant(item_end, tz)
+                if occurrence_start is not None and end_ms is not None and max(occurrence_start, end_ms) < now_ms:
+                    continue
+                push(_normalise(item, item_start, item_end, f"{uid}#{_occurrence_key(occurrence)}", calendar_tz))
                 kept += 1
-
-            for key, override in exceptions.get(uid, {}).items():
-                if key in used_exceptions or len(events) >= MAX_EVENTS:
-                    continue
-                over_start_prop = _datetime_prop(override, "DTSTART")
-                if over_start_prop is None:
-                    continue
-                over_tz_name = _tzid(override) or tz_name
-                over_tz = _zone(over_tz_name)
-                over_start = _as_utc(over_start_prop[0], over_tz)
-                over_end_prop = _datetime_prop(override, "DTEND")
-                over_end = _as_utc(over_end_prop[0], over_tz) if over_end_prop else None
-                if max(over_start, over_end or over_start) < now or over_start > horizon:
-                    continue
-                over_status = _one_line(_decoded(override, "STATUS")).upper()
-                push(
-                    _build_event(
-                        override,
-                        uid=uid,
-                        source_event_id=f"{uid}#{key}",
-                        start=over_start,
-                        end=over_end,
-                        all_day=all_day,
-                        tz_name=over_tz_name,
-                        cancelled=over_status == "CANCELLED",
-                        series_key=uid,
-                        series_label=series_label,
-                    ),
-                    f"{uid}#{key}",
-                )
+                if kept >= max_occurrences or len(events) >= max_events:
+                    break
         except Exception as exc:  # noqa: BLE001 - keep the rest of the feed
             errors.append({"event": uid, "message": f"Skipped: {exc}"})
 
-    for uid, overrides in exceptions.items():
-        if uid in masters:
-            continue
-        for key, component in overrides.items():
-            if len(events) >= MAX_EVENTS:
+    # Modified occurrences whose series isn't in the feed: treat each as a one-off.
+    for uid, items in exceptions.items():
+        for component in items:
+            if len(events) >= max_events:
                 break
-            start_prop = _datetime_prop(component, "DTSTART")
-            if start_prop is None:
-                continue
-            tz = _zone(_tzid(component) or calendar_tz)
-            start = _as_utc(start_prop[0], tz)
-            end_prop = _datetime_prop(component, "DTEND")
-            end = _as_utc(end_prop[0], tz) if end_prop else None
-            if max(start, end or start) < now or start > horizon:
-                continue
-            status = _one_line(_decoded(component, "STATUS")).upper()
-            push(
-                _build_event(
-                    component,
-                    uid=uid,
-                    source_event_id=f"{uid}#{key}",
-                    start=start,
-                    end=end,
-                    all_day=start_prop[1],
-                    tz_name=_tzid(component) or calendar_tz,
-                    cancelled=status == "CANCELLED",
-                    series_key=uid,
-                    series_label=None,
-                ),
-                f"{uid}#{key}",
-            )
+            try:
+                start = _time_prop(component, "DTSTART", zones)
+                if start is None:
+                    raise ValueError("no start date")
+                tz = _event_timezone(component, calendar_tz)
+                end = _end_date(component, start, zones)
+                if not keep_one_off(_to_instant(start, tz), _to_instant(end, tz)):
+                    continue
+                recurrence_id = _time_prop(component, "RECURRENCE-ID", zones)
+                if recurrence_id is None:
+                    raise ValueError("invalid recurrence-id")
+                push(_normalise(component, start, end, f"{uid}#{_occurrence_key(recurrence_id)}", calendar_tz))
+            except Exception as exc:  # noqa: BLE001
+                errors.append({"event": uid, "message": f"Skipped: {exc}"})
 
-    events.sort(key=lambda event: event["starts_at"] or "")
-    return FetchedFeed(events=events, errors=errors, coverage="complete")
+    events.sort(key=lambda event: event["starts_at"])
+    return FetchedFeed(events=events, errors=errors)
 
 
 class IcalConnector:
-    """Fetches an iCal URL and expands it into normalised events."""
+    """iCal feeds, with the platform's own clean-up for Luma / Meetup (`feedConnector`)."""
 
-    async def fetch(self, source: Any) -> FetchedFeed:
-        url = str(getattr(source, "url", None) or (source.get("url") if isinstance(source, dict) else "") or "")
-        if not url.lower().startswith(("http://", "https://")):
-            raise ConnectorError("The source URL must start with http:// or https://.")
-        host = urlparse(url).hostname or ""
-        if not host:
-            raise ConnectorError("The source URL has no host.")
-        try:
-            async with httpx.AsyncClient(
-                timeout=TIMEOUT_SECONDS,
-                follow_redirects=True,
-                headers={"User-Agent": USER_AGENT, "Accept": "text/calendar, text/plain;q=0.8, */*;q=0.1"},
-            ) as client:
-                response = await client.get(url)
-        except httpx.HTTPError as exc:
-            raise ConnectorError(f"Couldn't reach the feed ({exc.__class__.__name__}).") from exc
-        if response.status_code in (429, 503):
-            raise ConnectorError(
-                f"The feed asked us to slow down (HTTP {response.status_code}). We'll try again on the next refresh."
-            )
-        if response.status_code >= 400:
-            raise ConnectorError(f"The feed returned HTTP {response.status_code}.")
-        body = response.content
-        if len(body) > MAX_BYTES:
-            raise ConnectorError("The feed is larger than 5 MB.")
-        text = body.decode(response.encoding or "utf-8", errors="replace")
-        now = datetime.now(timezone.utc)
-        return parse_ical(text, now)
+    async def fetch(self, source: dict[str, Any], now: datetime) -> FetchedFeed:
+        text = await http.fetch_feed_text(source["url"])
+        result = parse_ical(text, now)
+        kind = source.get("kind") or "ical"
+        result.events = [platforms.clean_event(kind, event) for event in result.events]
+        return result
