@@ -291,6 +291,7 @@ async def send_emails(jobs: list[tuple[str, RenderedEmail]]) -> list[bool]:
 async def send_email(to: str, subject: str, html: str) -> bool:
     """One ad-hoc email (magic links). Returns whether it was accepted."""
     # Keep link targets in the text part: "Sign in to Orbit (https://...)".
-    text = html_to_text(re.sub(r'<a\s[^>]*href="([^"]*)"[^>]*>(.*?)</a>', r"\2 (\1)", html))
+    linked = re.sub(r'<a\s[^>]*href="([^"]*)"[^>]*>(.*?)</a>', r"\2 (\1)", html)
+    text = html_to_text(re.sub(r"</p>\s*", "</p>\n", linked)).strip()
     ok = await send_emails([(to, RenderedEmail(subject=subject, html=html, text=text))])
     return bool(ok and ok[0])
