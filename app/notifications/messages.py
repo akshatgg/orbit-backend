@@ -467,6 +467,53 @@ def organiser_decision_message(org: dict[str, Any], decision: Literal["approved"
     )
 
 
+# ─── circles & communities (in-app inbox companions) ────────────────────────
+
+
+def group_invite_message(group: dict[str, Any], inviter: str, path: str) -> Message:
+    """Someone invited you to a Circle or a Community."""
+    what = "circle" if group["kind"] == "circle" else "community"
+    name = group["name"]
+    title = f"{inviter} invited you to {name}"
+    return Message(
+        title=title,
+        body=f"Join the {what} on ORBIT to see the events they share.",
+        url=path,
+        tag=f"group-invite-{group['id']}",
+        email=EmailContent(
+            subject=title,
+            preheader=f"You're invited to the {what} {name} on ORBIT.",
+            heading="You're invited",
+            paragraphs=[
+                f"<b>{esc(inviter)}</b> invited you to join the {what} <b>{esc(name)}</b> on ORBIT.",
+                "Accept to see the events its members share and who's going.",
+            ],
+            details=[],
+            cta=("See the invite", path),
+            footer="You're getting this because someone invited you to a group on ORBIT.",
+        ),
+    )
+
+
+def direct_message_push(sender: str, body: str, path: str, conversation_id: str) -> Message:
+    """A new direct message. Push only: messages never go by email."""
+    preview = body if len(body) <= 120 else body[:117].rstrip() + "..."
+    return Message(
+        title=sender,
+        body=preview,
+        url=path,
+        tag=f"dm-{conversation_id}",
+        email=EmailContent(
+            subject=f"New message from {sender}",
+            preheader=preview,
+            heading=f"New message from {sender}",
+            paragraphs=[esc(preview)],
+            details=[],
+            cta=("Open ORBIT", path),
+        ),
+    )
+
+
 # ─── push payload and email rendering (templates.ts) ────────────────────────
 
 
