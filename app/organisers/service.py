@@ -383,14 +383,44 @@ async def revoke_invite(db: AsyncSession, invite_id: UUID | str, user: dict) -> 
     return {**invite, "revoked": True}
 
 
+def invite_problem(invite: dict, now: datetime | None = None) -> Optional[str]:
+    """Why a code cannot be used right now, in the order the join page explains it."""
+    now = now or datetime.now(timezone.utc)
+    if invite["revoked"]:
+        return "revoked"
+    if invite["expires_at"] <= now:
+        return "expired"
+    if invite["uses"] >= invite["max_uses"]:
+        return "used_up"
+    if invite["org_status"] != "approved":
+        return "org_inactive"
+    return None
+
+
 async def peek_invite(db: AsyncSession, code: str) -> dict:
+    """What the join page renders. 404 only for an unknown code; a dead code says why."""
     invite = await fn.peek_organiser_invite(db, code)
     if not invite:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "This invite link is not valid")
-    expires_at = invite.get("expires_at")
-    if expires_at is not None and expires_at <= datetime.now(timezone.utc):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "This invite link has expired")
-    return invite
+    reason = invite_problem(invite)
+    return {
+        "organiser": {
+            "id": invite["organiser_id"],
+            "name": invite["organiser_name"],
+            "slug": invite["organiser_slug"],
+            "logo_url": invite["logo_url"],
+            "status": invite["org_status"],
+        },
+        "role": invite["role"],
+        "expires_at": invite["expires_at"],
+        "revoked": invite["revoked"],
+        "max_uses": invite["max_uses"],
+        "uses": invite["uses"],
+        "uses_left": max(0, invite["max_uses"] - invite["uses"]),
+        "already_member": invite["already_member"],
+        "valid": reason is None,
+        "reason": reason,
+    }
 
 
 async def accept_invite(db: AsyncSession, code: str) -> dict:
