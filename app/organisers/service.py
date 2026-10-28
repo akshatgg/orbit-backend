@@ -248,14 +248,32 @@ async def organiser_page(
     }
 
 
+# Public organiser page lists: (where, order) per `when`. Drafts and removed
+# events are never public.
+PUBLIC_EVENT_LISTS = {
+    "upcoming": (
+        "status = 'published' and coalesce(ends_at, starts_at) >= now()",
+        "starts_at",
+    ),
+    "past": (
+        "status in ('published', 'cancelled', 'expired')"
+        " and (status = 'expired' or coalesce(ends_at, starts_at) < now())",
+        "starts_at desc",
+    ),
+    "all": ("status in ('published', 'cancelled', 'expired')", "starts_at"),
+}
+
+
 async def public_events_page(
-    db: AsyncSession, organiser_id: UUID | str, page: int, page_size: int
+    db: AsyncSession,
+    organiser_id: UUID | str,
+    page: int,
+    page_size: int,
+    when: str = "upcoming",
 ) -> dict:
-    """An organiser's published, upcoming events, paged, with guest counts."""
-    where = (
-        "organiser_id = :o and status = 'published' and duplicate_of is null"
-        " and coalesce(ends_at, starts_at) >= now()"
-    )
+    """An organiser's public events, paged, with guest counts."""
+    condition, order = PUBLIC_EVENT_LISTS[when]
+    where = f"organiser_id = :o and duplicate_of is null and {condition}"
     total = int(
         await _val(
             db, f"select count(*) from events where {where}", {"o": organiser_id}
@@ -265,7 +283,7 @@ async def public_events_page(
     items = await _all(
         db,
         f"select {EVENT_COLUMNS} from events where {where}"
-        " order by starts_at limit :lim offset :off",
+        f" order by {order}, id limit :lim offset :off",
         {"o": organiser_id, "lim": page_size, "off": offset(page, page_size)},
     )
     return {
