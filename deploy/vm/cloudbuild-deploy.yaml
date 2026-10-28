@@ -1,7 +1,8 @@
 # Push-to-deploy for markai-orbit, run by the Cloud Build trigger
 # `markai-orbit-deploy` on every push to master:
-#   build the single-container image  ->  push it  ->  SSH (IAP) into the VM
-#   and run bin/deploy, which swaps the container and waits for healthy.
+#   build the single-container image  ->  push it  ->  copy deploy/vm config to
+#   the VM  ->  SSH (IAP) in and run bin/deploy, which swaps the container and
+#   waits for healthy.
 # A container that does not come up healthy fails the build.
 #
 # Manual run of the same pipeline:
@@ -24,9 +25,16 @@ steps:
       - |
         set -e
         command -v ssh >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq openssh-client; }
+        # Ship this commit's deploy/vm config with the image, so a merged change
+        # to compose.yml, settings.env, the Caddyfile or bin/ reaches the VM too.
+        # Host-only files (/etc/markai-orbit/site.env, the data dir) are untouched.
+        tar -czf /tmp/vm-config.tgz -C deploy/vm compose.yml settings.env caddy bin
+        gcloud compute scp /tmp/vm-config.tgz markai-orbit:/tmp/vm-config.tgz \
+          --zone=us-central1-a --project=$PROJECT_ID \
+          --tunnel-through-iap --quiet --ssh-key-expire-after=30m
         gcloud compute ssh markai-orbit --zone=us-central1-a --project=$PROJECT_ID \
           --tunnel-through-iap --quiet --ssh-key-expire-after=30m \
-          --command="sudo /opt/markai-orbit/bin/deploy ${_IMAGE}:${_TAG}"
+          --command="sudo tar -xzf /tmp/vm-config.tgz --no-same-owner -C /opt/markai-orbit && rm -f /tmp/vm-config.tgz && sudo /opt/markai-orbit/bin/deploy ${_IMAGE}:${_TAG}"
 
 substitutions:
   _IMAGE: us-central1-docker.pkg.dev/${PROJECT_ID}/markai/markai-orbit
