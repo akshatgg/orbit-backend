@@ -114,49 +114,53 @@ admin token), not a cron target.
 
 ## Importing production data
 
-`scripts/migrate_prod_data.py` moves a live Orbit database into another
-Postgres (local, Cloud SQL, Neon, your own cluster). It reads the source in a
-read-only session and rebuilds the target.
+`seeds/prod.sql` is a **ready-to-apply export of the production database**
+(generated 2026-10-28 by `scripts/generate_seed.py`). On a freshly migrated
+database:
 
 ```bash
-# 1. schema first
 TARGET_DATABASE_URL=postgresql://orbit:orbit@localhost:5433/orbit \
   .venv/bin/alembic upgrade head
 
-# 2. data
-PROD_DATABASE_URL=postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres \
-TARGET_DATABASE_URL=postgresql://orbit:orbit@localhost:5433/orbit \
-  .venv/bin/python scripts/migrate_prod_data.py --truncate
-
-# 3. verify only (no writes)
-... .venv/bin/python scripts/migrate_prod_data.py --verify-only
+psql "$TARGET_DATABASE_URL" -f seeds/prod.sql
 ```
 
-What it does:
+The file guards itself: if the target already has events it aborts with
+"Refusing to seed twice" instead of duplicating the catalogue. It applies in
+under a second.
 
-- copies **auth.users → public.users** (id, email, verified timestamp), so
-  profiles, registrations and marks keep pointing at the same people;
-- copies every `public` table with `COPY`, skipping generated columns
-  (`events.search` is rebuilt by Postgres);
-- runs the load with `session_replication_role = replica`, so table order
-  cannot break it, then checks for orphans;
-- advances identity sequences (`event_interactions`, `notification_log`) past
-  the copied ids;
-- compares row counts table by table and exits non-zero on any difference.
+### What the export contains
 
-Tested against production on 2026-10-28: 3,879 events, 12 users, 22 tables —
-every count matched, and a second `--truncate` run produced the same result.
+| Source | Exported |
+|---|---|
+| `public.*` | every non-empty table — 21 tables, 5,143 rows (3,879 events, 520 audit rows, 474 source details, 106 interactions, 81 runs, 12 profiles, 8 sources, 1 registration, 15 categories, 21 duplicate dismissals …) |
+| `auth.users` | 12 users → `public.users`, ids and emails kept so profiles and registrations keep their person |
+| `auth.identities` | the 8 Google sign-ins → `users.google_sub`, so Google login re-links to the same account |
+| `storage.objects` | 1 file, `seeds/storage/logo.jpg` + `manifest.json` (unreferenced test upload) |
+| Cloudinary | nothing to move — all 822 event covers and every organiser logo are already Cloudinary URLs |
+| `auth.sessions`, `refresh_tokens`, `flow_state` | **intentionally not exported** — invalid on the new server, and carrying live credentials across is a liability |
 
 Two things it deliberately does not carry over:
 
 - **Password hashes.** Supabase stores bcrypt in `auth.users.encrypted_password`;
-  this schema stores hex. Migrated users sign in with a magic link (or Google,
-  which matches the existing row by email) and set a password afterwards.
-- **Storage objects.** Orbit's images are Cloudinary URLs; the one file in
-  Supabase Storage is not copied.
+  this schema stores hex. Migrated users sign in with a magic link (or Google)
+  and set a password afterwards.
+- **Storage files beyond the manifest.** See above: there are none in use.
 
-`session_replication_role` needs a superuser or the database owner. On Cloud SQL
-run the import as the instance owner, not the application user.
+### Regenerating after production changes
+
+```bash
+PROD_DATABASE_URL=postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres \
+  .venv/bin/python scripts/generate_seed.py > seeds/prod.sql
+```
+
+`scripts/migrate_prod_data.py` does the same job directly between two live
+databases (`--truncate`, `--verify-only`) without an intermediate file, if you
+prefer that for the final cutover.
+
+`session_replication_role` is not needed: the generator emits tables in foreign
+key order, so the file runs as the ordinary database owner — including on Cloud
+SQL, whose owner cannot set that parameter.
 
 ## Status
 
