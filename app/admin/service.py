@@ -49,6 +49,7 @@ EDITABLE_FIELDS: tuple[str, ...] = (
     "price_max",
     "currency",
     "is_featured",
+    "source_url",
 )
 
 _TIMESTAMP_FIELDS = {"starts_at", "ends_at", "registration_deadline"}
@@ -100,14 +101,15 @@ def _validate(values: dict[str, Any]) -> None:
 
 
 async def create_event(db: AsyncSession, payload: EventCreate, actor_id: UUID) -> UUID:
-    """Insert an admin-created published event with Orbit provenance."""
+    """Insert an admin-created published event (source "manual")."""
     values = _convert(payload.model_dump())
     _validate(values)
     now = _now()
     values.update(
         {
             "status": "published",
-            "source": "orbit",
+            # Added by an admin, as the frontend stored it (not an organiser's "orbit" event).
+            "source": "manual",
             "published_at": now,
             "created_by": actor_id,
             "needs_review": False,

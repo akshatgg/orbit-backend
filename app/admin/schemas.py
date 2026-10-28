@@ -66,8 +66,10 @@ class EventCreate(BaseModel):
     price_max: Decimal | None = Field(default=None, ge=0)
     currency: str = Field(default="GBP", min_length=3, max_length=3)
     is_featured: bool = False
+    # Where the admin found the event (the form's "Source link").
+    source_url: str | None = Field(default=None, max_length=2000)
 
-    @field_validator("cover_url", "external_url")
+    @field_validator("cover_url", "external_url", "source_url")
     @classmethod
     def _http_links(cls, value: str | None) -> str | None:
         return _http_url(value)
@@ -138,8 +140,9 @@ class EventUpdate(BaseModel):
     price_max: Decimal | None = Field(default=None, ge=0)
     currency: str | None = Field(default=None, min_length=3, max_length=3)
     is_featured: bool | None = None
+    source_url: str | None = Field(default=None, max_length=2000)
 
-    @field_validator("cover_url", "external_url")
+    @field_validator("cover_url", "external_url", "source_url")
     @classmethod
     def _http_links(cls, value: str | None) -> str | None:
         return _http_url(value)
