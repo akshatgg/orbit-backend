@@ -36,9 +36,16 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
 
-    # Email (Resend) --------------------------------------------------------
+    # Email -----------------------------------------------------------------
+    # SMTP when SMTP_HOST, SMTP_USER and SMTP_PASS are all set, else Resend when
+    # RESEND_API_KEY is set, else no email (locally the email is logged instead).
+    SMTP_HOST: Optional[str] = None
+    SMTP_PORT: Optional[str] = None  # 465 (implicit TLS) when blank; others use STARTTLS
+    SMTP_USER: Optional[str] = None
+    SMTP_PASS: Optional[str] = None
     RESEND_API_KEY: Optional[str] = None
-    EMAIL_FROM: str = "Orbit <hello@orbit.example>"
+    # Blank: "ORBIT <SMTP_USER>" over SMTP, "ORBIT <onboarding@resend.dev>" over Resend.
+    EMAIL_FROM: Optional[str] = None
 
     # Stripe ----------------------------------------------------------------
     STRIPE_SECRET_KEY: Optional[str] = None
@@ -117,6 +124,10 @@ class Settings(BaseSettings):
         if not math.isfinite(value) or value <= 0:
             return 0.0
         return min(value, 100.0)
+
+    @property
+    def push_configured(self) -> bool:
+        return bool(self.VAPID_PUBLIC_KEY and self.VAPID_PRIVATE_KEY)
 
     @property
     def cloudinary_configured(self) -> bool:
