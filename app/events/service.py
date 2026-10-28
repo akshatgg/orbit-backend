@@ -2,17 +2,20 @@
 
 import inspect
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import Text, and_, cast, func, or_, select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.categories.models import Category
 from app.core.config import settings
+from app.discovery.places import city_variants, known_city_names
+from app.discovery.taxonomy import ALL_INTERESTS, interest_tags  # noqa: F401  (re-exported)
 from app.events.models import Event, EventPrivate
 from app.organisers.models import Organiser
 from app.sql import functions as fn
@@ -24,54 +27,9 @@ logger = logging.getLogger(__name__)
 EMPTY_COUNTS = {"going": 0, "waitlisted": 0, "pending": 0}
 MAX_IDS = 200
 
-INTERESTS = [
-    ("entrepreneurship", "Entrepreneurship"),
-    ("consulting", "Consulting"),
-    ("technology", "Technology"),
-    ("finance", "Finance"),
-    ("marketing", "Marketing"),
-    ("sports", "Sports"),
-    ("arts", "Arts"),
-    ("social", "Social"),
-    ("music", "Music"),
-    ("food", "Food"),
-    ("health", "Health"),
-    ("education", "Education"),
-    ("sustainability", "Sustainability"),
-    ("law", "Law"),
-    ("media", "Media"),
-    ("design", "Design"),
-    ("travel", "Travel"),
-    ("community", "Community"),
-]
-INTEREST_LABELS = dict(INTERESTS)
-
-# Free-text tags people use that mean the same interest as the slug.
-INTEREST_SYNONYMS = {
-    "entrepreneurship": ["startup", "startups", "founders", "venture"],
-    "consulting": ["strategy", "case study"],
-    "technology": ["tech", "ai", "data", "software", "engineering"],
-    "finance": ["banking", "investment", "fintech"],
-    "marketing": ["brand", "advertising", "growth"],
-    "sports": ["sport", "fitness", "running"],
-    "arts": ["art", "culture", "theatre"],
-    "social": ["socialising", "networking", "meetup"],
-    "music": ["gig", "concert", "nightlife"],
-    "food": ["drink", "cuisine", "dining"],
-    "health": ["wellbeing", "wellness", "healthcare"],
-    "education": ["learning", "teaching", "students"],
-    "sustainability": ["esg", "climate", "net zero", "environment"],
-    "law": ["legal", "policy"],
-    "media": ["journalism", "publishing", "content"],
-    "design": ["ux", "product design", "creative"],
-    "travel": ["abroad", "international"],
-    "community": ["volunteering", "charity", "local"],
-}
-
-
-def interest_tags(slug: str) -> list[str]:
-    """The tags that count as an interest: its slug plus every synonym."""
-    return [slug, *INTEREST_SYNONYMS.get(slug, [])]
+# The interest options and their tag synonyms are the frontend's (`src/lib/taxonomy.ts`).
+INTERESTS = ALL_INTERESTS
+INTEREST_LABELS = dict(ALL_INTERESTS)
 
 
 def visible() -> list:
@@ -201,14 +159,159 @@ async def counts_rows(db: AsyncSession, event_ids: list[UUID]) -> list[dict]:
     ]
 
 
-async def cards(db: AsyncSession, stmt) -> list[dict]:
-    """Run a `card_query()` statement and attach counts."""
+async def cards(db: AsyncSession, stmt, *, collapse: bool = False) -> list[dict]:
+    """Run a `card_query()` statement and attach counts.
+
+    `collapse` keeps only the soonest date of each series among the rows (`next_of_each_series`).
+    """
     rows = (await db.execute(stmt)).all()
     items = [card(row[0], row[1], row[2]) for row in rows]
+    if collapse:
+        items = next_of_each_series(items)
+    return await with_counts(db, items)
+
+
+async def with_counts(db: AsyncSession, items: list[dict]) -> list[dict]:
+    """Fill each card's `counts`."""
     counts = await counts_map(db, [item["id"] for item in items])
     for item in items:
         item["counts"] = counts.get(item["id"], dict(EMPTY_COUNTS))
     return items
+
+
+# ─── Series and search (mirrors the frontend's src/lib/discovery/queries.ts) ──
+
+# Rows one search query reads at most, as the frontend's SEARCH_LIMIT.
+SEARCH_LIMIT = 80
+# Candidates a feed ranks, as the frontend's listCandidates.
+FEED_CANDIDATES = 200
+
+
+def next_of_each_series(items: list[dict]) -> list[dict]:
+    """Only the soonest date of each series (one-off events pass through), order kept."""
+    soonest: dict[str, dict] = {}
+    for item in items:
+        key = item.get("series_key")
+        if not key:
+            continue
+        best = soonest.get(key)
+        if best is None or item["starts_at"] < best["starts_at"]:
+            soonest[key] = item
+    return [item for item in items if not item.get("series_key") or soonest[item["series_key"]] is item]
+
+
+def next_dates_only(conditions: list):
+    """A condition keeping, of the events matching `conditions`, only each series' soonest date."""
+    numbered = (
+        select(
+            Event.id.label("id"),
+            func.row_number()
+            .over(
+                partition_by=func.coalesce(Event.series_key, cast(Event.id, Text)),
+                order_by=(Event.starts_at, Event.id),
+            )
+            .label("n"),
+        )
+        .where(*conditions)
+        .subquery()
+    )
+    return Event.id.in_(select(numbered.c.id).where(numbered.c.n == 1))
+
+
+def escape_like(value: str) -> str:
+    return re.sub(r"[\\%_]", lambda match: "\\" + match.group(0), value)
+
+
+def text_match(q: str):
+    return Event.search.op("@@")(func.websearch_to_tsquery("english", q))
+
+
+def organiser_match(q: str):
+    """The first 20 organisers whose name contains `q` (the frontend's organiser-name search)."""
+    return (
+        select(Organiser.id)
+        .where(Organiser.name.ilike(f"%{escape_like(q)}%", escape="\\"))
+        .limit(20)
+    )
+
+
+def search_filters(
+    *,
+    categories: list[str],
+    interests: list[str],
+    formats: list[str],
+    date_range: tuple[datetime, datetime] | None,
+    country: str | None,
+    city: str,
+) -> list:
+    """Visible events narrowed by the Explore filters (everything but the search text)."""
+    conditions = visible()
+    if date_range:
+        start, end = date_range
+        conditions += [func.coalesce(Event.ends_at, Event.starts_at) >= start, Event.starts_at < end]
+    if categories:
+        conditions.append(
+            Event.category_id.in_(select(Category.id).where(Category.slug.in_(categories)))
+        )
+    tags = [tag for value in interests for tag in interest_tags(value)]
+    if tags:
+        conditions.append(Event.tags.overlap(tags))
+    if formats:
+        conditions.append(Event.format.in_(formats))
+    if city:
+        # Any spelling of the city (Bangalore / Bengaluru), in the picked country or none stored.
+        conditions.append(
+            or_(*(Event.city.ilike(escape_like(name), escape="\\") for name in city_variants(city)))
+        )
+        if country:
+            conditions.append(or_(Event.country == country, Event.country.is_(None)))
+    elif country:
+        # Events stored with the country, plus city-only events in its known cities.
+        known = known_city_names(country)
+        conditions.append(
+            or_(Event.country == country, and_(Event.country.is_(None), Event.city.in_(known)))
+            if known
+            else Event.country == country
+        )
+    return conditions
+
+
+async def search_candidates(db: AsyncSession, conditions: list, q: str) -> tuple[list[dict], bool]:
+    """What the frontend's searchEvents ranks: the 80 soonest text matches plus the 80 soonest
+    events of organisers whose name matches, one card per series, with counts.
+
+    Returns the cards and whether a query hit the 80-row limit (`truncated`).
+    """
+
+    def base():
+        return card_query().where(*conditions).order_by(Event.starts_at).limit(SEARCH_LIMIT)
+
+    async def run(stmt) -> list[dict]:
+        return [card(row[0], row[1], row[2]) for row in (await db.execute(stmt)).all()]
+
+    if q:
+        rows = await run(base().where(text_match(q)))
+        organiser_ids = (await db.scalars(organiser_match(q))).all()
+        merged = {item["id"]: item for item in rows}
+        if organiser_ids:
+            for item in await run(base().where(Event.organiser_id.in_(organiser_ids))):
+                merged[item["id"]] = item
+        rows = list(merged.values())
+    else:
+        rows = await run(base())
+    items = await with_counts(db, next_of_each_series(rows))
+    return items, len(rows) >= SEARCH_LIMIT
+
+
+async def feed_candidates(
+    db: AsyncSession, *, until: datetime, limit: int = FEED_CANDIDATES
+) -> list[dict]:
+    """Visible events starting before `until`, soonest first, one card per series (listCandidates)."""
+    return await cards(
+        db,
+        card_query().where(*visible(), Event.starts_at < until).order_by(Event.starts_at).limit(limit),
+        collapse=True,
+    )
 
 
 async def event_row(db: AsyncSession, event_id: UUID):

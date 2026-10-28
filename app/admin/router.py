@@ -35,6 +35,7 @@ from app.events.models import Event
 from app.organisers.models import Organiser, OrganiserMember
 from app.sources.models import EventSource
 from app.sql import functions as fn
+from app.tickets.models import Registration
 from app.uploads.release import release_images
 from app.users.models import Profile, User
 
@@ -109,14 +110,15 @@ def _event_dict(event: Event) -> dict[str, Any]:
 
 
 def _source_label(source: str, names: dict[str, str]) -> str:
+    """The admin console's name for an `events.source` value (the frontend's `sourceLabel`)."""
     if source == "orbit":
-        return "ORBIT (organiser)"
+        return "Organiser"
     if source == "manual":
-        return "Added by an admin"
+        return "Admin"
     if source == "csv":
-        return "CSV import"
+        return "CSV"
     if source.startswith("source:"):
-        return names.get(source, "Deleted source")
+        return names.get(source) or f"Deleted source ({source[len('source:'):len('source:') + 8]})"
     return source
 
 
@@ -301,24 +303,29 @@ async def admin_events(
     elif when_value == "past":
         filters.append(func.coalesce(Event.ends_at, Event.starts_at) < now)
 
-    ascending = when_value != "past"
+    # Upcoming soonest first; past and any time newest first (as the admin events page).
+    ascending = when_value == "upcoming"
     listing = (
         await db.execute(
-            select(Event.id, Event.series_key, Event.starts_at)
+            select(Event.id, Event.series_key, Event.starts_at, Event.status)
             .where(*filters)
             .order_by(
                 Event.starts_at.asc() if ascending else Event.starts_at.desc(),
-                Event.id.asc(),
+                Event.id.asc() if ascending else Event.id.desc(),
             )
         )
     ).all()
 
     entries: list[list[UUID]] = []
     by_series: dict[str, list[UUID]] = {}
-    for event_id, series_key, _starts_at in listing:
+    dates_of: dict[str, list[dict[str, Any]]] = {}
+    for event_id, series_key, starts_at, event_status in listing:
         if not series_key:
             entries.append([event_id])
             continue
+        dates_of.setdefault(series_key, []).append(
+            {"id": event_id, "starts_at": starts_at, "status": event_status}
+        )
         dates = by_series.get(series_key)
         if dates is not None:
             dates.append(event_id)
@@ -355,9 +362,25 @@ async def admin_events(
         item["category_name"] = category_name
         item["source_name"] = _source_label(event.source, names)
         item["date_count"] = max(0, len(by_series.get(event.series_key or "", [])) - 1)
+        # Every date of the series in this listing (for the "N dates" dropdown), or null.
+        series_dates = dates_of.get(event.series_key or "", [])
+        item["series_dates"] = series_dates if len(series_dates) > 1 else None
         item.update(counts.get(str(event.id), {"going": 0, "waitlisted": 0, "pending": 0}))
         items.append(item)
     return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@router.get("/events/sources")
+async def admin_event_sources(
+    db: AsyncSession = Depends(get_db),
+    admin: dict = Depends(require_admin),
+) -> list[dict[str, str]]:
+    """Every value the events Source filter offers, labelled and sorted by label."""
+    used = (await db.scalars(select(Event.source).distinct())).all()
+    names = await _source_names(db)
+    keys = {"orbit", "manual", "csv", *used}
+    options = [{"key": key, "label": _source_label(key, names)} for key in keys]
+    return sorted(options, key=lambda option: (option["label"].casefold(), option["key"]))
 
 
 @router.post("/events", status_code=http_status.HTTP_201_CREATED)
@@ -378,17 +401,24 @@ async def admin_bulk_remove(
     db: AsyncSession = Depends(get_db),
     admin: dict = Depends(require_admin),
 ) -> dict[str, int]:
-    """Remove many events with one reason, logged as one audit row."""
-    result = await db.execute(
-        update(Event)
-        .where(Event.id.in_(body.ids))
-        .values(status="removed", cancel_reason=body.reason, updated_at=_now())
-    )
-    updated = result.rowcount or 0
-    await fn.log_admin_action(
-        db, "event.remove", "event", None, {"count": updated, "reason": body.reason, "bulk": True}
-    )
-    return {"updated": updated}
+    """Remove many events from ORBIT (unfeatured too), one audit row per event."""
+    values: dict[str, Any] = {"status": "removed", "is_featured": False, "updated_at": _now()}
+    if body.reason:
+        values["cancel_reason"] = body.reason
+    removed = (
+        await db.execute(
+            update(Event)
+            .where(Event.id.in_(body.ids))
+            .values(**values)
+            .returning(Event.id, Event.title)
+        )
+    ).all()
+    if not removed:
+        raise HTTPException(http_status.HTTP_404_NOT_FOUND, "Those events no longer exist")
+    details: dict[str, Any] = {"bulk": True, **({"reason": body.reason} if body.reason else {})}
+    for event_id, title in removed:
+        await fn.log_admin_action(db, "event.remove", "event", str(event_id), {"title": title, **details})
+    return {"updated": len(removed)}
 
 
 @router.post("/events/bulk/category")
@@ -424,15 +454,32 @@ async def admin_bulk_delete(
     db: AsyncSession = Depends(get_db),
     admin: dict = Depends(require_admin),
 ) -> dict[str, int]:
-    """Permanently delete many events."""
-    covers = (await db.scalars(select(Event.cover_url).where(Event.id.in_(body.ids)))).all()
-    result = await db.execute(delete(Event).where(Event.id.in_(body.ids)))
-    await release_images(db, covers)
-    deleted = result.rowcount or 0
-    await fn.log_admin_action(
-        db, "event.delete", "event", None, {"count": deleted, "bulk": True}
+    """Permanently delete many events and everything that cascades from them."""
+    return await _hard_delete(db, list(dict.fromkeys(body.ids)))
+
+
+async def _hard_delete(db: AsyncSession, ids: list[UUID]) -> dict[str, int]:
+    """Delete events (registrations, tickets, questions and marks cascade), log one audit row
+    each and release their covers no other row uses. 404 when none of them exists."""
+    doomed = (
+        await db.execute(select(Event.id, Event.title, Event.cover_url).where(Event.id.in_(ids)))
+    ).all()
+    if not doomed:
+        raise HTTPException(http_status.HTTP_404_NOT_FOUND, "Those events no longer exist")
+    event_ids = [row.id for row in doomed]
+    registrations = int(
+        await db.scalar(
+            select(func.count()).select_from(Registration).where(Registration.event_id.in_(event_ids))
+        )
+        or 0
     )
-    return {"deleted": deleted}
+    for row in doomed:
+        await fn.log_admin_action(
+            db, "event.delete", "event", str(row.id), {"title": row.title, "permanent": True}
+        )
+    result = await db.execute(delete(Event).where(Event.id.in_(event_ids)))
+    images = await release_images(db, [row.cover_url for row in doomed])
+    return {"deleted": result.rowcount or 0, "registrations": registrations, "images": images}
 
 
 @router.get("/events/{event_id}")
@@ -520,12 +567,12 @@ async def admin_remove_event(
     db: AsyncSession = Depends(get_db),
     admin: dict = Depends(require_admin),
 ) -> dict[str, Any]:
-    """Remove an event from public view with a reason."""
+    """Remove an event from public view (and unfeature it) with a reason."""
     event = await _get_event(db, event_id)
     await db.execute(
         update(Event)
         .where(Event.id == event_id)
-        .values(status="removed", cancel_reason=body.reason, updated_at=_now())
+        .values(status="removed", is_featured=False, cancel_reason=body.reason, updated_at=_now())
     )
     await fn.log_admin_action(
         db, "event.remove", "event", str(event_id), {"title": event.title, "reason": body.reason}
@@ -577,15 +624,11 @@ async def admin_delete_event(
     event_id: UUID,
     db: AsyncSession = Depends(get_db),
     admin: dict = Depends(require_admin),
-) -> dict[str, bool]:
+) -> dict[str, Any]:
     """Permanently delete an event, logging the action before the row goes."""
-    event = await _get_event(db, event_id)
-    await fn.log_admin_action(
-        db, "event.delete", "event", str(event_id), {"title": event.title}
-    )
-    await db.execute(delete(Event).where(Event.id == event_id))
-    await release_images(db, [event.cover_url])
-    return {"deleted": True}
+    await _get_event(db, event_id)
+    result = await _hard_delete(db, [event_id])
+    return {"deleted": True, "registrations": result["registrations"], "images": result["images"]}
 
 
 @router.get("/users")
@@ -840,6 +883,34 @@ async def admin_organisers(
     return {"items": items, "total": len(items), "page": 1, "page_size": len(items)}
 
 
+@router.get("/organisers/{organiser_id}/members")
+async def admin_organiser_members(
+    organiser_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    admin: dict = Depends(require_admin),
+) -> list[dict[str, Any]]:
+    """An organiser's team, earliest member first."""
+    exists = await db.scalar(select(Organiser.id).where(Organiser.id == organiser_id))
+    if exists is None:
+        raise HTTPException(http_status.HTTP_404_NOT_FOUND, "Organiser not found")
+    rows = (
+        await db.execute(
+            select(
+                OrganiserMember.user_id,
+                OrganiserMember.role,
+                OrganiserMember.created_at,
+                Profile.full_name,
+                func.coalesce(Profile.email, User.email).label("email"),
+            )
+            .outerjoin(Profile, Profile.id == OrganiserMember.user_id)
+            .outerjoin(User, User.id == OrganiserMember.user_id)
+            .where(OrganiserMember.organiser_id == organiser_id)
+            .order_by(OrganiserMember.created_at, OrganiserMember.user_id)
+        )
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
 @router.post("/organisers/{organiser_id}/decision")
 async def admin_organiser_decision(
     organiser_id: UUID,
@@ -1052,11 +1123,10 @@ async def admin_import_options(
     db: AsyncSession = Depends(get_db),
     admin: dict = Depends(require_admin),
 ) -> dict[str, Any]:
-    """Approved organisers and categories for the CSV importer."""
+    """Every organiser (any status, as the importer accepts any) and category for the CSV importer."""
     organisers = (
         await db.execute(
-            select(Organiser.id, Organiser.slug, Organiser.name)
-            .where(Organiser.status == "approved")
+            select(Organiser.id, Organiser.slug, Organiser.name, Organiser.status)
             .order_by(Organiser.name.asc())
         )
     ).mappings().all()
