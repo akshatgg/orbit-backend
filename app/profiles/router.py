@@ -71,7 +71,7 @@ async def me(user: dict = Depends(require_user), db: AsyncSession = Depends(get_
         await db.execute(
             text(
                 """
-                select o.id, o.name, o.slug, o.status, m.role
+                select o.*, m.role
                   from public.organiser_members m
                   join public.organisers o on o.id = m.organiser_id
                  where m.user_id = :id
