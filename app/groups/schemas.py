@@ -40,6 +40,8 @@ class MemberRole(BaseModel):
 class InviteCreate(BaseModel):
     email: Optional[str] = Field(default=None, max_length=320)
     user_id: Optional[str] = None
+    # "admin" (group admins only) makes them a community moderator / circle admin.
+    role: Literal["member", "admin"] = "member"
 
 
 class InviteRespond(BaseModel):

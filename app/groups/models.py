@@ -122,6 +122,9 @@ class GroupInvite(Base):
       group admin answers it.
     * `link`    — a shareable `code`; anyone with it joins until it expires.
 
+    `role` is what accepting it makes you: an invite from a group admin can be
+    'admin' (a community moderator); requests and links are always 'member'.
+
     A person holds at most one pending invite or request per group (partial
     unique index).
     """
@@ -146,6 +149,7 @@ class GroupInvite(Base):
     status: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'pending'")
     )
+    role: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'member'"))
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -165,6 +169,7 @@ class GroupInvite(Base):
             "invited_user_id is not null or code is not null", name="group_invites_target_check"
         ),
         CheckConstraint("kind in ('invite','request','link')", name="group_invites_kind_check"),
+        CheckConstraint("role in ('admin','member')", name="group_invites_role_check"),
         Index("group_invites_group_idx", "group_id"),
         Index("group_invites_invited_idx", "invited_user_id"),
         Index(
