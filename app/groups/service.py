@@ -39,13 +39,13 @@ AVATARS_PER_EVENT = 8
 EVENT_VISIBLE = "(e.organiser_id is null or o.status = 'approved')"
 UPCOMING = "coalesce(e.ends_at, e.starts_at) >= now()"
 
-# Events a community picks up by itself: published, not a duplicate, its category and
-# (when set) its university. Bound as :category / :university from the group row.
-MATCHED = """
-    e.category_id = cast(:category as uuid)
-    and e.status = 'published' and e.duplicate_of is null
+# Events a community picks up by itself: published, not a duplicate, in one of its
+# categories and (when set) its university. Bound as :categories / :university from the group.
+MATCHED_REST = """
+    e.status = 'published' and e.duplicate_of is null
     and (cast(:university as text) is null or lower(e.university) = lower(cast(:university as text)))
 """
+MATCHED = "e.category_id = any(cast(:categories as uuid[])) and " + MATCHED_REST
 
 # The card's computed columns, for rows of `p` (a page of groups that already carries
 # `my_role`). Each lateral runs once per row of the page, on an index.
@@ -55,7 +55,8 @@ select p.id, p.kind, p.name, p.slug, p.description, p.cover_url, p.university,
        p.allow_member_shares, p.created_by, p.created_at, p.my_role,
        mc.n as member_count,
        shared.n + matched.n as upcoming_event_count,
-       pr.pending as pending_request
+       pr.pending as pending_request,
+       cats.ids as cat_ids, cats.slugs as cat_slugs, cats.names as cat_names
   from page p
   left join public.categories c on c.id = p.category_id
   cross join lateral (
@@ -72,7 +73,7 @@ select p.id, p.kind, p.name, p.slug, p.description, p.cover_url, p.university,
     select count(*) as n
       from public.events e
       left join public.organisers o on o.id = e.organiser_id
-     where p.kind = 'community' and e.category_id = p.category_id
+     where p.kind = 'community' and e.category_id = any(p.category_ids)
        and e.status = 'published' and e.duplicate_of is null
        and (p.university is null or lower(e.university) = lower(p.university))
        and {UPCOMING} and {EVENT_VISIBLE}
@@ -86,6 +87,12 @@ select p.id, p.kind, p.name, p.slug, p.description, p.cover_url, p.university,
          and i.kind = 'request' and i.status = 'pending' and i.expires_at > now()
     ) as pending
   ) pr
+  cross join lateral (
+    select array_agg(c2.id order by x.n) as ids, array_agg(c2.slug order by x.n) as slugs,
+           array_agg(c2.name order by x.n) as names
+      from unnest(p.category_ids) with ordinality as x(id, n)
+      join public.categories c2 on c2.id = x.id
+  ) cats
 """
 
 
@@ -106,6 +113,10 @@ def group_out(row: Any) -> dict[str, Any]:
         "category_id": str(r["category_id"]) if r["category_id"] else None,
         "category_name": r["category_name"],
         "category_slug": r["category_slug"],
+        "categories": [
+            {"id": str(i), "slug": slug, "name": name}
+            for i, slug, name in zip(r["cat_ids"] or [], r["cat_slugs"] or [], r["cat_names"] or [])
+        ],
         "university": r["university"],
         "cover_url": r["cover_url"],
         "allow_member_shares": r["allow_member_shares"],
@@ -149,6 +160,7 @@ async def resolve(db: AsyncSession, ref: str) -> dict:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Group not found")
     g = dict(row)
     g["id"] = str(g["id"])
+    g["category_ids"] = [str(c) for c in g.get("category_ids") or []]
     return g
 
 
@@ -218,11 +230,12 @@ async def directory(
     if category:
         try:
             params["category_id"] = str(UUID(category))
-            where.append("g.category_id = cast(:category_id as uuid)")
+            where.append("g.category_ids @> array[cast(:category_id as uuid)]")
         except ValueError:
             params["category_slug"] = category.strip().lower()
             where.append(
-                "g.category_id = (select id from public.categories where slug = :category_slug)"
+                "g.category_ids @> array[(select id from public.categories"
+                " where slug = :category_slug)]"
             )
     if university:
         where.append("lower(g.university) = lower(:university)")
@@ -282,17 +295,42 @@ async def resolve_category(db: AsyncSession, ref: Optional[str]) -> Optional[str
     """A category id from an id or a slug; None for blank. 422 when unknown."""
     if not ref or not ref.strip():
         return None
-    ref = ref.strip()
-    try:
-        key, value = "id", str(UUID(ref))
-    except ValueError:
-        key, value = "slug", ref.lower()
-    found = (
-        await db.execute(text(f"select id from public.categories where {key} = :v"), {"v": value})
-    ).scalar_one_or_none()
-    if not found:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unknown category")
-    return str(found)
+    return (await resolve_categories(db, [ref]))[0]
+
+
+async def resolve_categories(db: AsyncSession, refs: list[str]) -> list[str]:
+    """Category ids from ids or slugs, in the order given, without repeats. One query;
+    422 naming any that don't exist."""
+    wanted = [r.strip() for r in refs if r and r.strip()]
+    if not wanted:
+        return []
+    ids, slugs = [], []
+    for ref in wanted:
+        try:
+            ids.append(str(UUID(ref)))
+        except ValueError:
+            slugs.append(ref.lower())
+    rows = (
+        await db.execute(
+            text(
+                "select id, slug from public.categories"
+                " where id = any(cast(:ids as uuid[])) or slug = any(cast(:slugs as text[]))"
+            ),
+            {"ids": ids, "slugs": slugs},
+        )
+    ).all()
+    by_ref = {str(r[0]): str(r[0]) for r in rows} | {r[1]: str(r[0]) for r in rows}
+    unknown = [ref for ref in wanted if by_ref.get(ref) is None and by_ref.get(ref.lower()) is None]
+    if unknown:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, f"Unknown category: {', '.join(unknown)}"
+        )
+    out: list[str] = []
+    for ref in wanted:
+        cid = by_ref.get(ref) or by_ref[ref.lower()]
+        if cid not in out:
+            out.append(cid)
+    return out
 
 
 def slugify(name: str) -> str:
@@ -446,10 +484,12 @@ async def member_previews(db: AsyncSession, group_ids: list[str], per_group: int
 
 
 def _feed_branches(g: dict, when: str, keyset: str, *, limited: bool = True) -> str:
-    """Shared events, plus (communities, upcoming only) what its category picks up.
+    """Shared events, plus (communities, upcoming only) what its categories pick up.
 
-    Each branch is ordered and limited on its own, so each reads its index from
-    the cursor position; the outer query merges at most 2 x limit rows.
+    Each branch is ordered and limited on its own, and the matched branch reads
+    each category separately (a lateral per category on `events_feed_idx`), so
+    every read starts at the cursor position; the outer query merges at most
+    (1 + categories) x limit rows.
     """
     timing = UPCOMING if when == "upcoming" else f"not ({UPCOMING})"
     order = "e.starts_at, e.id" if when == "upcoming" else "e.starts_at desc, e.id desc"
@@ -465,16 +505,21 @@ def _feed_branches(g: dict, when: str, keyset: str, *, limited: bool = True) -> 
             and {timing}{keyset}
           {page})
     """
-    if not (g["kind"] == "community" and g.get("category_id") and when == "upcoming"):
+    if not (g["kind"] == "community" and g.get("category_ids") and when == "upcoming"):
         return shared
     matched = f"""
-        (select e.id, null::uuid, null::text, null::timestamptz, e.starts_at, e.id
-           from public.events e
-           left join public.organisers o on o.id = e.organiser_id
-          where {MATCHED} and {EVENT_VISIBLE} and {timing}{keyset}
-            and not exists (select 1 from public.group_events ge
-                             where ge.group_id = :g and ge.event_id = e.id)
-          {page})
+        (select m.id, null::uuid, null::text, null::timestamptz, m.starts_at, m.id
+           from (select distinct unnest(cast(:categories as uuid[]))) as cat(id)
+           cross join lateral (
+             select e.id, e.starts_at
+               from public.events e
+               left join public.organisers o on o.id = e.organiser_id
+              where e.category_id = cat.id and {MATCHED_REST}
+                and {EVENT_VISIBLE} and {timing}{keyset}
+                and not exists (select 1 from public.group_events ge
+                                 where ge.group_id = :g and ge.event_id = e.id)
+              {page}
+           ) m)
     """
     return shared + " union all " + matched
 
@@ -492,7 +537,7 @@ async def feed(
     params: dict[str, Any] = {
         "g": g["id"],
         "limit": limit + 1,
-        "category": str(g["category_id"]) if g.get("category_id") else None,
+        "categories": g.get("category_ids") or [],
         "university": g.get("university") or None,
     }
     keyset = ""
@@ -619,11 +664,11 @@ async def in_feed(db: AsyncSession, g: dict, event_id: str) -> bool:
     ).first()
     if shared:
         return True
-    if g["kind"] != "community" or not g.get("category_id"):
+    if g["kind"] != "community" or not g.get("category_ids"):
         return False
     return (
         await db.execute(
             text(f"select 1 from public.events e where e.id = :e and {MATCHED}"),
-            {"e": event_id, "category": str(g["category_id"]), "university": g.get("university")},
+            {"e": event_id, "categories": g["category_ids"], "university": g.get("university")},
         )
     ).first() is not None

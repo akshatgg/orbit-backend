@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Create Orbit's first eight Communities. Safe to run again: existing slugs are left alone.
+"""Create Orbit's launch Communities. Safe to run again: existing ones are updated, not duplicated.
 
     DATABASE_URL=postgresql://... python scripts/seed_communities.py
     DATABASE_URL=postgresql://... python scripts/seed_communities.py --creator someone@example.com
 
-Each community is public, open to every university, and mapped to the closest
-existing category (the first slug in its list that exists), so its feed picks
-up that category's upcoming events. The creator (default: the earliest
-super_admin, else the earliest admin) becomes each community's admin.
+Each community is public, open to every university, and linked to every listed
+category that exists (a missing slug is skipped with a warning), so its feed
+picks up those categories' upcoming events. The first category is its primary
+one. On a re-run, a community whose slug already exists gets its categories and
+description refreshed; its name, visibility and members are left alone. The
+creator (default: the earliest super_admin, else the earliest admin) becomes
+each new community's admin.
 """
 
 from __future__ import annotations
@@ -23,37 +26,13 @@ from sqlalchemy import create_engine, text  # noqa: E402
 
 from app.core.database import get_sync_database_url  # noqa: E402
 
-# (slug, name, description, category slugs in order of preference)
+# (slug, name, description, category slugs — primary first)
 COMMUNITIES: list[tuple[str, str, str, list[str]]] = [
     (
-        "entrepreneurship-startups",
-        "Entrepreneurship & Startups",
-        "Founders, builders and the startup-curious: pitch nights, founder talks and hackathons.",
-        ["entrepreneurship"],
-    ),
-    (
-        "consulting-strategy",
-        "Consulting & Strategy",
-        "Case practice, firm presentations and strategy talks for future consultants.",
-        ["employer-presentation", "workshop", "talk"],
-    ),
-    (
-        "technology-ai",
-        "Technology & AI",
-        "Software, data and AI: workshops, hackathons and tech talks.",
-        ["workshop", "competition", "talk"],
-    ),
-    (
-        "finance-investment",
-        "Finance & Investment",
-        "Banking, investing and markets: insight days, careers fairs and finance talks.",
+        "careers-networking",
+        "Careers & Networking",
+        "Careers fairs, employer sessions and networking nights to meet your next team.",
         ["careers-fair", "employer-presentation", "networking"],
-    ),
-    (
-        "marketing-branding",
-        "Marketing & Branding",
-        "Brand, growth and creative marketing: talks, panels and workshops.",
-        ["talk", "workshop"],
     ),
     (
         "sports-fitness",
@@ -62,16 +41,40 @@ COMMUNITIES: list[tuple[str, str, str, list[str]]] = [
         ["fitness"],
     ),
     (
-        "arts-culture",
-        "Arts & Culture",
-        "Exhibitions, theatre, film and music around campus and the city.",
+        "hobbies-socials",
+        "Hobbies & Socials",
+        "Society meetups, socials and new hobbies to try with good company.",
+        ["hobbies-and-passion", "social", "society"],
+    ),
+    (
+        "travel-outdoors",
+        "Travel & Outdoors",
+        "Day trips, hikes and adventures beyond campus.",
+        ["travel-and-outdoors"],
+    ),
+    (
+        "arts-culture-music",
+        "Arts, Culture & Music",
+        "Gigs, galleries, theatre and everything creative around the city.",
         ["arts-culture", "music"],
     ),
     (
-        "social-weekend",
-        "Social Events & Weekend Activities",
-        "Socials, trips and things to do at the weekend.",
-        ["social", "travel-and-outdoors", "hobbies-and-passion"],
+        "workshops-talks",
+        "Workshops & Talks",
+        "Hands-on workshops, talks and panels to learn something new.",
+        ["workshop", "talk"],
+    ),
+    (
+        "startups-entrepreneurship",
+        "Startups & Entrepreneurship",
+        "Pitch nights, founder talks and competitions for builders and the startup-curious.",
+        ["entrepreneurship", "competition"],
+    ),
+    (
+        "sustainability-impact",
+        "Sustainability & Impact",
+        "Climate, volunteering and projects that make a difference.",
+        ["sustainability"],
     ),
 ]
 
@@ -102,7 +105,7 @@ def find_creator(conn, ref: str | None) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--creator", help="user id or email of the admin who owns them")
+    parser.add_argument("--creator", help="user id or email of the admin who owns new ones")
     args = parser.parse_args()
 
     engine = create_engine(get_sync_database_url())
@@ -112,39 +115,46 @@ def main() -> None:
             slug: str(cid)
             for cid, slug in conn.execute(text("select id, slug from public.categories"))
         }
-        for slug, name, description, preferred in COMMUNITIES:
-            category = next((categories[s] for s in preferred if s in categories), None)
-            group_id = conn.execute(
+        for slug, name, description, wanted in COMMUNITIES:
+            linked = [s for s in wanted if s in categories]
+            for missing in (s for s in wanted if s not in categories):
+                print(f"  warning  {slug}: no category {missing!r}, skipped")
+            ids = [categories[s] for s in linked]
+            row = conn.execute(
                 text(
                     """
                     insert into public.groups
-                      (kind, name, slug, description, visibility, category_id, created_by)
+                      (kind, name, slug, description, visibility, category_id, category_ids,
+                       created_by)
                     values ('community', :name, :slug, :description, 'public',
-                            cast(:category as uuid), :creator)
-                    on conflict (slug) do nothing
-                    returning id
+                            cast(:primary as uuid), cast(:ids as uuid[]), :creator)
+                    on conflict (slug) do update
+                      set description = excluded.description,
+                          category_id = excluded.category_id,
+                          category_ids = excluded.category_ids,
+                          updated_at = now()
+                    returning id, (xmax = 0) as created
                     """
                 ),
                 {
                     "name": name,
                     "slug": slug,
                     "description": description,
-                    "category": category,
+                    "primary": ids[0] if ids else None,
+                    "ids": ids,
                     "creator": creator,
                 },
-            ).scalar()
-            if group_id is None:
-                print(f"  exists   {slug}")
-                continue
-            conn.execute(
-                text(
-                    "insert into public.group_members (group_id, user_id, role)"
-                    " values (:g, :u, 'admin') on conflict do nothing"
-                ),
-                {"g": group_id, "u": creator},
-            )
-            mapped = next((s for s in preferred if s in categories), "none")
-            print(f"  created  {slug}  (category: {mapped})")
+            ).first()
+            if row.created:
+                conn.execute(
+                    text(
+                        "insert into public.group_members (group_id, user_id, role)"
+                        " values (:g, :u, 'admin') on conflict do nothing"
+                    ),
+                    {"g": row.id, "u": creator},
+                )
+            state = "created" if row.created else "updated"
+            print(f"  {state:<8} {slug}  (categories: {', '.join(linked) or 'none'})")
 
 
 if __name__ == "__main__":

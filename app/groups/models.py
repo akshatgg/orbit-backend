@@ -28,6 +28,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db_base import Base
@@ -44,8 +45,13 @@ class Group(Base):
     slug: Mapped[str | None] = mapped_column(Text, unique=True)
     description: Mapped[str | None] = mapped_column(Text)
     cover_url: Mapped[str | None] = mapped_column(Text)
+    # The primary category (the first of category_ids), kept for older clients.
     category_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("categories.id", ondelete="SET NULL")
+    )
+    # Every category a community's feed picks up, primary first.
+    category_ids: Mapped[list[uuid.UUID]] = mapped_column(
+        ARRAY(Uuid), nullable=False, server_default=text("'{}'::uuid[]")
     )
     university: Mapped[str | None] = mapped_column(Text)
     visibility: Mapped[str] = mapped_column(
@@ -82,6 +88,7 @@ class Group(Base):
         Index("groups_kind_visibility_idx", "kind", "visibility"),
         Index("groups_category_idx", "category_id"),
         Index("groups_kind_category_idx", "kind", "category_id"),
+        Index("groups_category_ids_idx", "category_ids", postgresql_using="gin"),
     )
 
 
