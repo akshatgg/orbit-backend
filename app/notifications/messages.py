@@ -470,10 +470,37 @@ def organiser_decision_message(org: dict[str, Any], decision: Literal["approved"
 # ─── circles & communities (in-app inbox companions) ────────────────────────
 
 
-def group_invite_message(group: dict[str, Any], inviter: str, path: str) -> Message:
-    """Someone invited you to a Circle or a Community."""
+def group_invite_message(
+    group: dict[str, Any], inviter: str, path: str, role: str = "member"
+) -> Message:
+    """Someone invited you to a Circle or a Community — as a member, or (`role='admin'`)
+    to help run it: a community's moderator, a circle's admin."""
     what = "circle" if group["kind"] == "circle" else "community"
     name = group["name"]
+    footer = "You're getting this because someone invited you to a group on ORBIT."
+    if role == "admin":
+        job = "be an admin of" if group["kind"] == "circle" else "moderate"
+        title = f"{inviter} invited you to {job} {name}"
+        return Message(
+            title=title,
+            body=f"Accept to help run the {what} on ORBIT.",
+            url=path,
+            tag=f"group-invite-{group['id']}",
+            email=EmailContent(
+                subject=title,
+                preheader=f"You're invited to {job} the {what} {name} on ORBIT.",
+                heading="You're invited to help run it",
+                paragraphs=[
+                    f"<b>{esc(inviter)}</b> invited you to {job} the {what} <b>{esc(name)}</b>"
+                    " on ORBIT.",
+                    "Accept to join it and help run it: share events, post announcements"
+                    " and look after its members.",
+                ],
+                details=[],
+                cta=("See the invite", path),
+                footer=footer,
+            ),
+        )
     title = f"{inviter} invited you to {name}"
     return Message(
         title=title,
@@ -490,7 +517,7 @@ def group_invite_message(group: dict[str, Any], inviter: str, path: str) -> Mess
             ],
             details=[],
             cta=("See the invite", path),
-            footer="You're getting this because someone invited you to a group on ORBIT.",
+            footer=footer,
         ),
     )
 

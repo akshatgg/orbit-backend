@@ -39,11 +39,25 @@ from app.users.brief import user_brief, user_columns
 router = APIRouter(prefix="/groups", tags=["groups"], route_class=NumbersRoute)
 
 INVITES_PER_HOUR = 30
-LINK_PATH = "/join/circle/{code}"
+LINK_PATHS = {"circle": "/join/circle/{code}", "community": "/join/community/{code}"}
 
 
 def _display_name(user: dict) -> str:
     return (user.get("full_name") or "").strip() or "Someone on ORBIT"
+
+
+def _admin_title(g: dict) -> tuple[str, str]:
+    """What a group admin is called, bare and with its article: a community's
+    moderator, a circle's admin."""
+    if g["kind"] == "circle":
+        return "admin", "an admin"
+    return "moderator", "a moderator"
+
+
+def _last_admin(g: dict) -> str:
+    word, _ = _admin_title(g)
+    what = "circle" if g["kind"] == "circle" else "community"
+    return f"A {what} needs at least one {word}"
 
 
 # ─── discovery / CRUD ───────────────────────────────────────────────────────
@@ -322,27 +336,36 @@ async def accept_invite_link(
     return {"group_id": group_id, "kind": invite["kind"], "slug": invite["slug"], "status": "joined"}
 
 
-async def _make_member(db: AsyncSession, group_id: str, user_id: str) -> None:
-    """Add a member; any pending invite or request of theirs for this group is settled."""
-    await db.execute(
-        text(
-            "insert into public.group_members (group_id, user_id, role) values (:g, :u, 'member')"
-            " on conflict do nothing"
-        ),
-        {"g": group_id, "u": user_id},
-    )
+async def _make_member(
+    db: AsyncSession, group_id: str, user_id: str, role: str = "member"
+) -> None:
+    """Add a member with `role`; any pending invite or request of theirs for this group is settled.
+
+    A live admin (moderator) invite settled here still makes them an admin, and
+    `role='admin'` raises someone who is already a member; nothing here demotes.
+    """
     settled = (
         await db.execute(
             text(
                 "update public.group_invites set status = 'accepted'"
                 " where group_id = :g and invited_user_id = :u and status = 'pending'"
-                " returning id"
+                " returning id, kind, role, expires_at > now() as live"
             ),
             {"g": group_id, "u": user_id},
         )
-    ).scalars().all()
-    for invite_id in settled:
-        await inbox.mark_invite_read(db, invite_id)
+    ).mappings().all()
+    if any(r["kind"] == "invite" and r["role"] == "admin" and r["live"] for r in settled):
+        role = "admin"
+    await db.execute(
+        text(
+            "insert into public.group_members as m (group_id, user_id, role) values (:g, :u, :r)"
+            " on conflict (group_id, user_id) do update set role = excluded.role"
+            " where excluded.role = 'admin' and m.role <> 'admin'"
+        ),
+        {"g": group_id, "u": user_id, "r": role},
+    )
+    for r in settled:
+        await inbox.mark_invite_read(db, r["id"])
 
 
 @router.get("/{group_id}")
@@ -613,7 +636,7 @@ async def remove_member(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Group admins only")
     target = str(user_id)
     if await _target_role(db, g["id"], target) == "admin" and await gs.admin_count(db, g["id"]) <= 1:
-        raise HTTPException(status.HTTP_409_CONFLICT, "A group needs at least one admin")
+        raise HTTPException(status.HTTP_409_CONFLICT, _last_admin(g))
     await db.execute(
         text("delete from public.group_members where group_id = :g and user_id = :u"),
         {"g": g["id"], "u": target},
@@ -637,7 +660,7 @@ async def set_member_role(
     target = str(user_id)
     current = await _target_role(db, g["id"], target)
     if current == "admin" and body.role == "member" and await gs.admin_count(db, g["id"]) <= 1:
-        raise HTTPException(status.HTTP_409_CONFLICT, "A group needs at least one admin")
+        raise HTTPException(status.HTTP_409_CONFLICT, _last_admin(g))
     await db.execute(
         text("update public.group_members set role = :r where group_id = :g and user_id = :u"),
         {"r": body.role, "g": g["id"], "u": target},
@@ -653,16 +676,23 @@ async def set_member_role(
 async def create_invite(
     group_id: str,
     body: InviteCreate,
+    response: Response,
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Invite someone who has an Orbit account, by email (or user id).
 
     Circles: any member. Communities: group admins and Orbit admins.
-    409 when they're already a member or already invited.
+    `role: "admin"` (group admins; Orbit admins for communities) invites them as a
+    moderator (a circle admin): a member is promoted straight away (200,
+    `status: "promoted"`), and a pending invite of theirs is upgraded.
+    409 when they're already a member (or already an admin) or already invited.
     """
     g = await gs.resolve(db, group_id)
     role = await gs.role_of(db, g["id"], user)
+    admin_word, an_admin = _admin_title(g)
+    if body.role == "admin" and not gs.can_manage(g, role, user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, f"Only {admin_word}s can add {admin_word}s")
     if not gs.can_invite(g, role, user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You can't invite people to this group")
     if not (body.email or body.user_id):
@@ -703,44 +733,96 @@ async def create_invite(
     target = str(target)
     if target == str(user["id"]):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "You're already in this group")
-    if await gs.role_of(db, g["id"], {"id": target}):
-        raise HTTPException(status.HTTP_409_CONFLICT, "They're already a member")
+    inviter = _display_name(user)
+
+    target_role = await gs.role_of(db, g["id"], {"id": target})
+    if target_role:
+        if body.role != "admin":
+            raise HTTPException(status.HTTP_409_CONFLICT, "They're already a member")
+        promoted = (
+            await db.execute(
+                text(
+                    "update public.group_members set role = 'admin'"
+                    " where group_id = :g and user_id = :t and role <> 'admin' returning user_id"
+                ),
+                {"g": g["id"], "t": target},
+            )
+        ).first()
+        if not promoted:
+            raise HTTPException(status.HTTP_409_CONFLICT, f"They're already {an_admin}")
+        what = "circle" if g["kind"] == "circle" else "community"
+        await inbox.notify(
+            db,
+            [target],
+            "request_approved",
+            f"You're now {an_admin} of {g['name']}",
+            body=f"{inviter} made you {an_admin}, so you can help run the {what}.",
+            link=gs.group_path(g),
+            actor_id=str(user["id"]),
+            group_id=g["id"],
+        )
+        response.status_code = status.HTTP_200_OK
+        return {
+            "status": "promoted",
+            "group_id": g["id"],
+            "user": await _user_brief(db, target),
+        }
 
     await _expire_stale(db, g["id"], target)
+    returning = "returning id, status, role, created_at, expires_at"
     row = (
         await db.execute(
             text(
-                """
-                insert into public.group_invites (group_id, kind, invited_user_id, invited_by)
-                values (:g, 'invite', :t, :by)
+                f"""
+                insert into public.group_invites
+                  (group_id, kind, invited_user_id, invited_by, role)
+                values (:g, 'invite', :t, :by, :role)
                 on conflict (group_id, invited_user_id)
                   where status = 'pending' and invited_user_id is not null
                   do nothing
-                returning id, status, created_at, expires_at
+                {returning}
                 """
             ),
-            {"g": g["id"], "t": target, "by": str(user["id"])},
+            {"g": g["id"], "t": target, "by": str(user["id"]), "role": body.role},
         )
     ).mappings().first()
     if not row:
         existing = (
             await db.execute(
                 text(
-                    "select kind from public.group_invites where group_id = :g"
+                    "select id, kind, role from public.group_invites where group_id = :g"
                     " and invited_user_id = :t and status = 'pending'"
                 ),
                 {"g": g["id"], "t": target},
             )
-        ).scalar_one_or_none()
-        if existing == "request":
+        ).mappings().first()
+        if existing and existing["kind"] == "request":
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "They've asked to join already — approve their request"
             )
-        raise HTTPException(status.HTTP_409_CONFLICT, "They're already invited")
+        if existing and body.role == "admin" and existing["role"] != "admin":
+            # Upgrade their pending invite; the new notification replaces the old one.
+            row = (
+                await db.execute(
+                    text(
+                        "update public.group_invites set role = 'admin', invited_by = :by"
+                        f" where id = :id and status = 'pending' {returning}"
+                    ),
+                    {"id": existing["id"], "by": str(user["id"])},
+                )
+            ).mappings().first()
+            if row:
+                await db.execute(
+                    text(
+                        "delete from public.notifications where invite_id = :i and user_id = :t"
+                    ),
+                    {"i": existing["id"], "t": target},
+                )
+        if not row:
+            raise HTTPException(status.HTTP_409_CONFLICT, "They're already invited")
 
-    inviter = _display_name(user)
     path = "/circles" if g["kind"] == "circle" else gs.group_path(g)
-    message = group_invite_message(g, inviter, path)
+    message = group_invite_message(g, inviter, path, row["role"])
     await inbox.notify(
         db,
         [target],
@@ -753,21 +835,13 @@ async def create_invite(
         invite_id=row["id"],
         deliver=message,
     )
-    invitee = (
-        await db.execute(
-            text(
-                f"select {user_columns('u.id', 'p', 'u_')} from public.users u"
-                " left join public.profiles p on p.id = u.id where u.id = :t"
-            ),
-            {"t": target},
-        )
-    ).mappings().first()
     return {
         "id": str(row["id"]),
         "kind": "invite",
         "status": row["status"],
+        "role": row["role"],
         "group_id": g["id"],
-        "user": user_brief(invitee, "u_"),
+        "user": await _user_brief(db, target),
         "invited_by": {
             "id": str(user["id"]),
             "full_name": user.get("full_name"),
@@ -779,13 +853,29 @@ async def create_invite(
     }
 
 
+async def _user_brief(db: AsyncSession, user_id: str) -> Optional[dict]:
+    row = (
+        await db.execute(
+            text(
+                f"select {user_columns('u.id', 'p', 'u_')} from public.users u"
+                " left join public.profiles p on p.id = u.id where u.id = :t"
+            ),
+            {"t": user_id},
+        )
+    ).mappings().first()
+    return user_brief(row, "u_") if row else None
+
+
 @router.get("/{group_id}/invites")
 async def list_invites(
     group_id: str,
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Pending invites and join requests (`kind: invite|request`), newest first. Group admins."""
+    """Pending invites and join requests (`kind: invite|request`), newest first. Group admins.
+
+    `role` is what accepting makes them: 'admin' for a moderator invite, else 'member'.
+    """
     g = await gs.resolve(db, group_id)
     if not gs.can_manage(g, await gs.role_of(db, g["id"], user), user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Group admins only")
@@ -793,7 +883,7 @@ async def list_invites(
         await db.execute(
             text(
                 f"""
-                select i.id, i.kind, i.status, i.created_at, i.expires_at,
+                select i.id, i.kind, i.status, i.role, i.created_at, i.expires_at,
                        {user_columns("i.invited_user_id", "p", "u_")},
                        {user_columns("i.invited_by", "bp", "by_")}
                   from public.group_invites i
@@ -813,6 +903,7 @@ async def list_invites(
             "id": str(r["id"]),
             "kind": r["kind"],
             "status": r["status"],
+            "role": r["role"],
             "user": user_brief(r, "u_"),
             "invited_by": user_brief(r, "by_") if r["kind"] == "invite" else None,
             "created_at": r["created_at"],
@@ -833,6 +924,8 @@ async def respond_invite(
 ) -> dict:
     """Answer an invite (only the invitee) or a join request (only a group admin).
 
+    Accepting an invite makes them a member with the invite's role.
+
     The requester may withdraw their own request (`accept: false`). 409 when it was
     already answered, 410 when it has expired.
     """
@@ -840,7 +933,7 @@ async def respond_invite(
     invite = (
         await db.execute(
             text(
-                "select id, kind, status, invited_user_id, expires_at > now() as live"
+                "select id, kind, status, role, invited_user_id, expires_at > now() as live"
                 " from public.group_invites where id = :id and group_id = :g"
             ),
             {"id": str(invite_id), "g": g["id"]},
@@ -881,13 +974,9 @@ async def respond_invite(
         raise HTTPException(status.HTTP_409_CONFLICT, "This was already answered")
     await inbox.mark_invite_read(db, invite_id)
     if new_status == "accepted":
-        await db.execute(
-            text(
-                "insert into public.group_members (group_id, user_id, role)"
-                " values (:g, :u, 'member') on conflict do nothing"
-            ),
-            {"g": g["id"], "u": subject},
-        )
+        # An invite makes them what it says (a moderator invite: an admin); a request, a member.
+        role = invite["role"] if invite["kind"] == "invite" else "member"
+        await _make_member(db, g["id"], subject, role)
         if invite["kind"] == "request":
             await inbox.notify(
                 db,
@@ -908,7 +997,11 @@ async def invite_link(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """A shareable join link (reused while it has more than a day left; 14 days from minting)."""
+    """A shareable join link (reused while it has more than a day left; 14 days from minting).
+
+    `url_path` is the frontend page for it: `/join/circle/{code}` or `/join/community/{code}`.
+    Anyone signed in who opens it joins as a member, even an approval community.
+    """
     g = await gs.resolve(db, group_id)
     if not gs.can_invite(g, await gs.role_of(db, g["id"], user), user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You can't invite people to this group")
@@ -938,7 +1031,7 @@ async def invite_link(
         ).mappings().first()
     return {
         "code": row["code"],
-        "url_path": LINK_PATH.format(code=row["code"]),
+        "url_path": LINK_PATHS[g["kind"]].format(code=row["code"]),
         "expires_at": row["expires_at"],
     }
 
