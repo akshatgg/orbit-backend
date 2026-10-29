@@ -248,6 +248,7 @@ class GroupAnnouncement(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         CheckConstraint("char_length(body) between 1 and 1000", name="group_announcements_body_check"),
