@@ -97,6 +97,7 @@ async def notify_group(
     link: Optional[str] = None,
     actor_id: Any = None,
     invite_id: Any = None,
+    announcement_id: Any = None,
 ) -> None:
     """In-app only: every member (or every admin) of a group except the actor."""
     role = " and m.role = 'admin'" if admins_only else ""
@@ -104,15 +105,19 @@ async def notify_group(
         text(
             f"""
             insert into public.notifications
-              (user_id, kind, title, body, link, actor_id, group_id, invite_id)
+              (user_id, kind, title, body, link, actor_id, group_id, invite_id, announcement_id)
             select m.user_id, :kind, :title, :body, :link,
-                   cast(:actor as uuid), cast(:group_id as uuid), cast(:invite_id as uuid)
+                   cast(:actor as uuid), cast(:group_id as uuid), cast(:invite_id as uuid),
+                   cast(:announcement_id as uuid)
               from public.group_members m
              where m.group_id = cast(:group_id as uuid){role}
                and m.user_id is distinct from cast(:actor as uuid)
             """
         ),
-        _params(kind, title, body, link, actor_id, group_id, invite_id),
+        {
+            **_params(kind, title, body, link, actor_id, group_id, invite_id),
+            "announcement_id": str(announcement_id) if announcement_id else None,
+        },
     )
 
 

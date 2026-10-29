@@ -15,9 +15,11 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Identity,
     Index,
     Text,
     UniqueConstraint,
@@ -85,7 +87,11 @@ class ConversationMember(Base):
 
 
 class Message(Base):
-    """A deleted message keeps its row (so the thread reads "Message deleted") but not its text."""
+    """A deleted message keeps its row (so the thread reads "Message deleted") but not its text.
+
+    `updated_at` is set whenever an existing message changes (edited or deleted), so an
+    open thread's poll can pick those changes up (`changed_since`); it is null until then.
+    """
 
     __tablename__ = "messages"
 
@@ -100,6 +106,8 @@ class Message(Base):
     )
     body: Mapped[str] = mapped_column(Text, nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -111,6 +119,34 @@ class Message(Base):
         ),
         Index("messages_conversation_idx", "conversation_id", text("created_at desc"), text("id desc")),
         Index("messages_sender_idx", "sender_id", "created_at"),
+        Index(
+            "messages_changed_idx",
+            "conversation_id",
+            "updated_at",
+            postgresql_where=text("updated_at is not null"),
+        ),
+    )
+
+
+class MessageEdit(Base):
+    """One row per edit, so edits count toward the sending rate limit. Holds no text."""
+
+    __tablename__ = "message_edits"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False
+    )
+    editor_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    edited_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("message_edits_editor_idx", "editor_id", "edited_at"),
+        Index("message_edits_message_idx", "message_id"),
     )
 
 

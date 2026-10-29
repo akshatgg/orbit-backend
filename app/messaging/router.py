@@ -1,10 +1,11 @@
 """Circle chat and direct messages (polling, no websockets).
 
 The open thread polls `GET /messages/conversations/{id}?after=<created_at of the
-newest message>`; the nav badge polls `GET /messages/unread-count`. Messages
-never go to the notifications inbox; a direct message sends a web push only
-when the recipient has no unread push from that conversation in the last 10
-minutes.
+newest message>&changed_since=<polled_at of the last response>` (new messages in
+`items`, edits and deletes of older ones in `changed`); the nav badge polls
+`GET /messages/unread-count`. Messages never go to the notifications inbox; a
+direct message sends a web push only when the recipient has no unread push from
+that conversation in the last 10 minutes.
 """
 
 from datetime import datetime
@@ -129,6 +130,7 @@ async def get_thread(
     after_id: Optional[UUID] = None,
     before: Optional[datetime] = None,
     before_id: Optional[UUID] = None,
+    changed_since: Optional[datetime] = None,
     limit: int = Query(50, ge=1, le=CURSOR_LIMIT_MAX),
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
@@ -138,9 +140,12 @@ async def get_thread(
     With `after` (the polling path) `conversation` is the slim `{id, kind, group, other_user}`;
     otherwise it is the full list item plus `members`. `has_more` says whether more
     messages lie beyond the page (older ones, or with `after` newer ones).
+
+    Edits and deletes: pass the previous response's `polled_at` as `changed_since` and
+    `changed` lists the messages edited or deleted since then (replace them by id).
     """
     c = await ms.open_conversation(db, conversation_id, str(user["id"]))
-    items, more = await ms.thread(
+    items, more, changed = await ms.thread(
         db,
         str(conversation_id),
         str(user["id"]),
@@ -149,6 +154,7 @@ async def get_thread(
         before=before,
         before_id=str(before_id) if before_id else None,
         limit=limit,
+        changed_since=changed_since,
     )
     if after is not None:
         conversation = ms.slim(c)
@@ -158,7 +164,13 @@ async def get_thread(
         )
         conversation = listed["items"][0] if listed["items"] else ms.slim(c)
         conversation["members"] = await ms.members(db, c, user)
-    return {"conversation": conversation, "items": items, "has_more": more}
+    return {
+        "conversation": conversation,
+        "items": items,
+        "has_more": more,
+        "changed": changed,
+        "polled_at": c["polled_at"],
+    }
 
 
 @router.post("/conversations/{conversation_id}", status_code=201)
@@ -185,13 +197,30 @@ async def read_conversation(
     return {"ok": True, "unread_total": await ms.unread_total(db, str(user["id"]))}
 
 
+@router.patch("/{message_id}")
+async def edit_message(
+    message_id: UUID,
+    body: MessageCreate,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Edit my own message (1-2000 characters) while I can still send in its conversation.
+
+    409 if it was deleted. Edits count toward the 20-a-minute limit; other people's open
+    threads get the new text through `changed`.
+    """
+    return await ms.edit(db, message_id, user, body.body)
+
+
 @router.delete("/{message_id}", status_code=204)
 async def delete_message(
     message_id: UUID,
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """Delete my own message: it stays in the thread as "Message deleted", without its text."""
+    """Delete my own message: it stays in the thread as "Message deleted", without its text.
+
+    Other people's open threads get it through `changed`."""
     row = (
         await db.execute(
             text("select sender_id, deleted_at from public.messages where id = :id"),
@@ -204,7 +233,10 @@ async def delete_message(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only delete your own messages")
     if row["deleted_at"] is None:
         await db.execute(
-            text("update public.messages set deleted_at = now(), body = '' where id = :id"),
+            text(
+                "update public.messages set deleted_at = now(), body = '', updated_at = now()"
+                " where id = :id"
+            ),
             {"id": str(message_id)},
         )
     return Response(status_code=204)

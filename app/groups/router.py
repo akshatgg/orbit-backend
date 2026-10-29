@@ -23,6 +23,7 @@ from app.core.routing import NumbersRoute
 from app.groups import service as gs
 from app.groups.schemas import (
     AnnouncementCreate,
+    AnnouncementUpdate,
     GroupCreate,
     GroupUpdate,
     InterestBody,
@@ -1151,6 +1152,31 @@ async def event_interest(
 
 # ─── announcements ──────────────────────────────────────────────────────────
 
+ANNOUNCEMENT_SELECT = f"""
+select a.id, a.body, a.event_id, a.created_at, a.edited_at, e.title as event_title,
+       {user_columns("a.author_id", "p", "a_")}
+  from public.group_announcements a
+  left join public.profiles p on p.id = a.author_id
+  left join public.events e on e.id = a.event_id
+"""
+
+
+def _announcement(r: Any, *, manager: bool, me: str) -> dict:
+    """An announcement, with whether I may edit/delete it (its author, a group admin,
+    or for a community an Orbit admin)."""
+    allowed = manager or (r["a_id"] is not None and str(r["a_id"]) == me)
+    return {
+        "id": str(r["id"]),
+        "body": r["body"],
+        "event_id": str(r["event_id"]) if r["event_id"] else None,
+        "event_title": r["event_title"],
+        "author": user_brief(r, "a_"),
+        "created_at": r["created_at"],
+        "edited_at": r["edited_at"],
+        "can_edit": allowed,
+        "can_delete": allowed,
+    }
+
 
 @router.get("/{group_id}/announcements")
 async def list_announcements(
@@ -1165,34 +1191,13 @@ async def list_announcements(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Join this group to read its announcements")
     rows = (
         await db.execute(
-            text(
-                f"""
-                select a.id, a.body, a.event_id, a.created_at, e.title as event_title,
-                       {user_columns("a.author_id", "p", "a_")}
-                  from public.group_announcements a
-                  left join public.profiles p on p.id = a.author_id
-                  left join public.events e on e.id = a.event_id
-                 where a.group_id = :g
-                 order by a.created_at desc
-                 limit 50
-                """
-            ),
+            text(ANNOUNCEMENT_SELECT + " where a.group_id = :g order by a.created_at desc limit 50"),
             {"g": g["id"]},
         )
     ).mappings().all()
-    items = [_announcement(r) for r in rows]
+    manager = gs.can_manage(g, role, user)
+    items = [_announcement(r, manager=manager, me=str(user["id"])) for r in rows]
     return {"items": items, "total": len(items)}
-
-
-def _announcement(r: Any) -> dict:
-    return {
-        "id": str(r["id"]),
-        "body": r["body"],
-        "event_id": str(r["event_id"]) if r["event_id"] else None,
-        "event_title": r["event_title"],
-        "author": user_brief(r, "a_"),
-        "created_at": r["created_at"],
-    }
 
 
 @router.post("/{group_id}/announcements", status_code=201)
@@ -1207,25 +1212,15 @@ async def create_announcement(
     if not gs.can_manage(g, await gs.role_of(db, g["id"], user), user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Group admins only")
     event_id = gs.as_uuid(body.event_id, "event id") if body.event_id else None
-    row = (
+    announcement_id = (
         await db.execute(
             text(
-                f"""
-                with a as (
-                  insert into public.group_announcements (group_id, author_id, body, event_id)
-                  values (:g, :a, :b, cast(:e as uuid))
-                  returning id, body, event_id, created_at, author_id
-                )
-                select a.id, a.body, a.event_id, a.created_at, e.title as event_title,
-                       {user_columns("a.author_id", "p", "a_")}
-                  from a
-                  left join public.profiles p on p.id = a.author_id
-                  left join public.events e on e.id = a.event_id
-                """
+                "insert into public.group_announcements (group_id, author_id, body, event_id)"
+                " values (:g, :a, :b, cast(:e as uuid)) returning id"
             ),
             {"g": g["id"], "a": str(user["id"]), "b": body.body.strip(), "e": event_id},
         )
-    ).mappings().first()
+    ).scalar_one()
     await inbox.notify_group(
         db,
         g["id"],
@@ -1234,5 +1229,73 @@ async def create_announcement(
         body=body.body.strip()[:200],
         link=gs.group_path(g),
         actor_id=str(user["id"]),
+        announcement_id=announcement_id,
     )
-    return _announcement(row)
+    return await _announcement_out(db, g, str(announcement_id), user)
+
+
+async def _announcement_out(db: AsyncSession, g: dict, announcement_id: str, user: dict) -> dict:
+    row = (
+        await db.execute(text(ANNOUNCEMENT_SELECT + " where a.id = :id"), {"id": announcement_id})
+    ).mappings().first()
+    manager = gs.can_manage(g, await gs.role_of(db, g["id"], user), user)
+    return _announcement(row, manager=manager, me=str(user["id"]))
+
+
+async def _editable_announcement(
+    db: AsyncSession, group_id: str, announcement_id: UUID, user: dict
+) -> tuple[dict, str]:
+    """The group and announcement if I may change it: 404 if it isn't in this group,
+    403 unless I wrote it, I'm a group admin, or (a community) I'm an Orbit admin."""
+    g = await gs.resolve(db, group_id)
+    author = (
+        await db.execute(
+            text(
+                "select author_id from public.group_announcements where id = :id and group_id = :g"
+            ),
+            {"id": str(announcement_id), "g": g["id"]},
+        )
+    ).first()
+    if author is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Announcement not found")
+    mine = author[0] is not None and str(author[0]) == str(user["id"])
+    if not (mine or gs.can_manage(g, await gs.role_of(db, g["id"], user), user)):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Only its author or a group admin can change this"
+        )
+    return g, str(announcement_id)
+
+
+@router.patch("/{group_id}/announcements/{announcement_id}")
+async def update_announcement(
+    group_id: str,
+    announcement_id: UUID,
+    body: AnnouncementUpdate,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Edit an announcement's text. Its author, a group admin, or (communities) an Orbit admin."""
+    g, aid = await _editable_announcement(db, group_id, announcement_id, user)
+    await db.execute(
+        text("update public.group_announcements set body = :b, edited_at = now() where id = :id"),
+        {"b": body.body, "id": aid},
+    )
+    # Inbox entries quote the announcement: keep them current.
+    await db.execute(
+        text("update public.notifications set body = :b where announcement_id = :id"),
+        {"b": body.body[:200], "id": aid},
+    )
+    return await _announcement_out(db, g, aid, user)
+
+
+@router.delete("/{group_id}/announcements/{announcement_id}", status_code=204)
+async def delete_announcement(
+    group_id: str,
+    announcement_id: UUID,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Delete an announcement and its inbox notifications. Same people as editing."""
+    _, aid = await _editable_announcement(db, group_id, announcement_id, user)
+    await db.execute(text("delete from public.group_announcements where id = :id"), {"id": aid})
+    return Response(status_code=204)

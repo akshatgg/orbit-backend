@@ -28,7 +28,12 @@ from app.users.brief import user_brief, user_columns
 
 logger = logging.getLogger(__name__)
 
-MESSAGES_PER_MINUTE = 20
+MESSAGES_PER_MINUTE = 20  # sends and edits together
+# A poll re-sends changes from slightly before `changed_since`, so an edit whose
+# transaction commits just after a poll still reaches the next one. Clients apply
+# `changed` by id, so a repeat is harmless.
+CHANGE_OVERLAP_SECONDS = 5
+MAX_CHANGES_PER_POLL = 200
 DM_PUSH_QUIET_MINUTES = 10
 
 # Messages from someone I blocked are hidden from me everywhere.
@@ -91,6 +96,7 @@ def message_out(r: Any, conversation_id: Optional[str] = None) -> dict[str, Any]
         "body": "" if deleted else r["body"],
         "deleted": deleted,
         "created_at": r["created_at"],
+        "edited_at": r.get("edited_at"),
     }
 
 
@@ -189,7 +195,7 @@ async def open_conversation(db: AsyncSession, conversation_id: UUID, me: str) ->
         await db.execute(
             text(
                 f"""
-                select c.id, c.kind, c.group_id, g.name as group_name,
+                select c.id, c.kind, c.group_id, g.name as group_name, now() as polled_at,
                        gm.created_at as joined_at,
                        (c.user_a = cast(:me as uuid) or c.user_b = cast(:me as uuid)) as participant,
                        {user_columns("x.other_id", "op", "o_")},
@@ -297,6 +303,12 @@ async def members(db: AsyncSession, c: dict[str, Any], me: dict) -> list[dict[st
 # ─── the thread ─────────────────────────────────────────────────────────────
 
 
+MESSAGE_COLUMNS = f"""
+    m.id, m.body, m.deleted_at, m.edited_at, m.created_at,
+    {user_columns("m.sender_id", "p", "s_")}
+"""
+
+
 async def thread(
     db: AsyncSession,
     conversation_id: str,
@@ -307,11 +319,14 @@ async def thread(
     before: Any,
     before_id: Optional[str],
     limit: int,
-) -> tuple[list[dict[str, Any]], bool]:
-    """Messages oldest -> newest, and whether more exist beyond the page.
+    changed_since: Any = None,
+) -> tuple[list[dict[str, Any]], bool, list[dict[str, Any]]]:
+    """Messages oldest -> newest, whether more exist beyond the page, and what changed.
 
     `after` (polling) reads forward from a point; otherwise the newest page, or the
     page before `before`. `after_id`/`before_id` break ties on equal timestamps.
+    `changed_since` also returns older messages edited or deleted since then (the
+    poll's `polled_at`), in the same query: two index range scans, no more.
     """
     params: dict[str, Any] = {"c": conversation_id, "me": me, "limit": limit + 1}
     if after is not None:
@@ -332,27 +347,38 @@ async def thread(
                 cond = "m.created_at < :before"
             params["before"] = before
         order = "m.created_at desc, m.id desc"
-    rows = (
-        await db.execute(
-            text(
-                f"""
-                select m.id, m.body, m.deleted_at, m.created_at,
-                       {user_columns("m.sender_id", "p", "s_")}
-                  from public.messages m
-                  left join public.profiles p on p.id = m.sender_id
-                 where m.conversation_id = :c and {cond} and {NOT_BLOCKED_SENDER}
-                 order by {order}
-                 limit :limit
-                """
-            ),
-            params,
-        )
-    ).mappings().all()
-    more = len(rows) > limit
-    rows = rows[:limit]
+    page = f"""
+        (select {MESSAGE_COLUMNS}, false as changed
+           from public.messages m
+           left join public.profiles p on p.id = m.sender_id
+          where m.conversation_id = :c and {cond} and {NOT_BLOCKED_SENDER}
+          order by {order}
+          limit :limit)
+    """
+    changes = ""
+    if changed_since is not None:
+        params["since"] = changed_since
+        params["max_changes"] = MAX_CHANGES_PER_POLL
+        outside_page = f" and not ({cond})" if after is not None else ""
+        changes = f"""
+        union all
+        (select {MESSAGE_COLUMNS}, true as changed
+           from public.messages m
+           left join public.profiles p on p.id = m.sender_id
+          where m.conversation_id = :c and m.updated_at is not null
+            and m.updated_at > cast(:since as timestamptz) - interval '{CHANGE_OVERLAP_SECONDS} seconds'
+            and {NOT_BLOCKED_SENDER}{outside_page}
+          order by m.updated_at
+          limit :max_changes)
+        """
+    rows = (await db.execute(text(page + changes), params)).mappings().all()
+    fresh = [r for r in rows if not r["changed"]]
+    changed = [message_out(r, conversation_id) for r in rows if r["changed"]]
+    more = len(fresh) > limit
+    fresh = fresh[:limit]
     if after is None:
-        rows = list(reversed(rows))
-    return [message_out(r, conversation_id) for r in rows], more
+        fresh = list(reversed(fresh))
+    return [message_out(r, conversation_id) for r in fresh], more, changed
 
 
 async def mark_read(db: AsyncSession, conversation_id: str, me: str) -> None:
@@ -368,20 +394,15 @@ async def mark_read(db: AsyncSession, conversation_id: str, me: str) -> None:
     )
 
 
-async def send(db: AsyncSession, c: dict[str, Any], me: dict, body: str) -> dict[str, Any]:
-    """Store a message (rate-limited), mark it read for me, and push a DM if it's due."""
-    uid = str(me["id"])
-    other = str(c["o_id"]) if c["kind"] == "direct" and c["o_id"] else None
-    if other and not await share_a_group(db, uid, other):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "You can only message people you share a circle or community with",
-        )
+async def check_rate(db: AsyncSession, uid: str) -> None:
+    """At most MESSAGES_PER_MINUTE sends and edits together in any minute. One query, two index ranges."""
     recent = (
         await db.execute(
             text(
-                "select count(*) from public.messages"
-                " where sender_id = :me and created_at > now() - interval '1 minute'"
+                "select (select count(*) from public.messages"
+                "         where sender_id = :me and created_at > now() - interval '1 minute')"
+                "     + (select count(*) from public.message_edits"
+                "         where editor_id = :me and edited_at > now() - interval '1 minute')"
             ),
             {"me": uid},
         )
@@ -392,6 +413,67 @@ async def send(db: AsyncSession, c: dict[str, Any], me: dict, body: str) -> dict
             "You're sending messages too fast — wait a moment",
             headers={"Retry-After": "60"},
         )
+
+
+async def edit(db: AsyncSession, message_id: UUID, me: dict, body: str) -> dict[str, Any]:
+    """Change my own message's text while I can still send in its conversation."""
+    uid = str(me["id"])
+    row = (
+        await db.execute(
+            text("select conversation_id, sender_id, deleted_at from public.messages where id = :id"),
+            {"id": str(message_id)},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Message not found")
+    if str(row["sender_id"]) != uid:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only edit your own messages")
+    if row["deleted_at"] is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This message was deleted")
+    c = await open_conversation(db, row["conversation_id"], uid)
+    other = str(c["o_id"]) if c["kind"] == "direct" and c["o_id"] else None
+    if other and not await share_a_group(db, uid, other):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "You can only message people you share a circle or community with",
+        )
+    await check_rate(db, uid)
+    cid = str(row["conversation_id"])
+    updated = (
+        await db.execute(
+            text(
+                f"""
+                with m as (
+                  update public.messages
+                     set body = :b, edited_at = now(), updated_at = now()
+                   where id = :id and deleted_at is null
+                  returning id, body, deleted_at, edited_at, created_at, sender_id
+                ), logged as (
+                  insert into public.message_edits (message_id, editor_id)
+                  select id, sender_id from m
+                )
+                select {MESSAGE_COLUMNS}
+                  from m left join public.profiles p on p.id = m.sender_id
+                """
+            ),
+            {"id": str(message_id), "b": body},
+        )
+    ).mappings().first()
+    if not updated:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This message was deleted")
+    return message_out(updated, cid)
+
+
+async def send(db: AsyncSession, c: dict[str, Any], me: dict, body: str) -> dict[str, Any]:
+    """Store a message (rate-limited), mark it read for me, and push a DM if it's due."""
+    uid = str(me["id"])
+    other = str(c["o_id"]) if c["kind"] == "direct" and c["o_id"] else None
+    if other and not await share_a_group(db, uid, other):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "You can only message people you share a circle or community with",
+        )
+    await check_rate(db, uid)
     cid = str(c["id"])
     row = (
         await db.execute(
@@ -400,13 +482,12 @@ async def send(db: AsyncSession, c: dict[str, Any], me: dict, body: str) -> dict
                 with m as (
                   insert into public.messages (conversation_id, sender_id, body)
                   values (:c, :me, :b)
-                  returning id, body, deleted_at, created_at, sender_id
+                  returning id, body, deleted_at, edited_at, created_at, sender_id
                 ), touched as (
                   update public.conversations set last_message_at = (select created_at from m)
                    where id = :c
                 )
-                select m.id, m.body, m.deleted_at, m.created_at,
-                       {user_columns("m.sender_id", "p", "s_")}
+                select {MESSAGE_COLUMNS}
                   from m left join public.profiles p on p.id = m.sender_id
                 """
             ),

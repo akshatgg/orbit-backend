@@ -1,6 +1,6 @@
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class GroupCreate(BaseModel):
@@ -58,3 +58,15 @@ class InterestBody(BaseModel):
 class AnnouncementCreate(BaseModel):
     body: str = Field(min_length=1, max_length=1000)
     event_id: Optional[str] = None
+
+
+class AnnouncementUpdate(BaseModel):
+    body: str = Field(max_length=2000)
+
+    @field_validator("body")
+    @classmethod
+    def _length(cls, value: str) -> str:
+        value = value.strip()
+        if not 1 <= len(value) <= 1000:
+            raise ValueError("An announcement is 1 to 1000 characters")
+        return value

@@ -20,6 +20,7 @@ from app.messaging.models import (  # noqa: F401
     Conversation,
     ConversationMember,
     Message,
+    MessageEdit,
     UserBlock,
 )
 from app.notifications.models import (  # noqa: F401
@@ -86,5 +87,6 @@ __all__ = [
     "Conversation",
     "ConversationMember",
     "Message",
+    "MessageEdit",
     "UserBlock",
 ]

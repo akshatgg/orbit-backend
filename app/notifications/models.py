@@ -121,6 +121,10 @@ class Notification(Base):
     invite_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("group_invites.id", ondelete="SET NULL")
     )
+    # Deleting the announcement deletes its notifications.
+    announcement_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("group_announcements.id", ondelete="CASCADE")
+    )
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -140,4 +144,9 @@ class Notification(Base):
         ),
         Index("notifications_group_idx", "group_id"),
         Index("notifications_invite_idx", "invite_id", postgresql_where=text("invite_id is not null")),
+        Index(
+            "notifications_announcement_idx",
+            "announcement_id",
+            postgresql_where=text("announcement_id is not null"),
+        ),
     )
