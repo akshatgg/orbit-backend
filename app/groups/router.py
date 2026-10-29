@@ -63,7 +63,8 @@ async def list_groups(
 ) -> dict:
     """The Communities directory (joined first, then by name), or my groups with `mine=1`.
 
-    `kind=circle` always means my circles. `category` is a category slug or id.
+    `kind=circle` always means my circles. `category` (a slug or id) matches any of a
+    community's categories.
     Pages by keyset: pass `next_cursor` back as `cursor`.
     """
     return await gs.directory(
@@ -104,17 +105,21 @@ async def create_group(
             slug = await gs.unique_slug(db, body.slug)
         else:
             slug = await gs.unique_slug(db, gs.slugify(body.name))
-    category_id = await gs.resolve_category(db, body.category_id)
+    if body.category_ids is not None:
+        category_ids = await gs.resolve_categories(db, body.category_ids)
+    else:
+        primary = await gs.resolve_category(db, body.category_id)
+        category_ids = [primary] if primary else []
     group_id = (
         await db.execute(
             text(
                 """
                 insert into public.groups
-                  (kind, name, slug, description, visibility, category_id, university,
-                   cover_url, allow_member_shares, created_by)
+                  (kind, name, slug, description, visibility, category_id, category_ids,
+                   university, cover_url, allow_member_shares, created_by)
                 values (:kind, :name, :slug, :description, :visibility,
-                        cast(:category_id as uuid), :university, :cover_url,
-                        :allow_member_shares, :uid)
+                        cast(:category_id as uuid), cast(:category_ids as uuid[]),
+                        :university, :cover_url, :allow_member_shares, :uid)
                 returning id
                 """
             ),
@@ -124,7 +129,8 @@ async def create_group(
                 "slug": slug,
                 "description": body.description,
                 "visibility": visibility,
-                "category_id": category_id,
+                "category_id": category_ids[0] if category_ids else None,
+                "category_ids": category_ids,
                 "university": (body.university or "").strip() or None,
                 "cover_url": body.cover_url,
                 "allow_member_shares": True if body.allow_member_shares is None else body.allow_member_shares,
@@ -395,8 +401,16 @@ async def update_group(
         fields["cover_url"] = sent["cover_url"]
     if "university" in sent:
         fields["university"] = (sent["university"] or "").strip() or None
-    if "category_id" in sent:
-        fields["category_id"] = await gs.resolve_category(db, sent["category_id"])
+    # category_id is the primary category, always category_ids' first entry.
+    if "category_ids" in sent:
+        ids = await gs.resolve_categories(db, sent["category_ids"] or [])
+        fields["category_ids"] = ids
+        fields["category_id"] = ids[0] if ids else None
+    elif "category_id" in sent:
+        primary = await gs.resolve_category(db, sent["category_id"])
+        ids = [primary] + [c for c in g["category_ids"] if c != primary] if primary else []
+        fields["category_ids"] = ids
+        fields["category_id"] = primary
     if sent.get("visibility"):
         if g["kind"] == "circle":
             if sent["visibility"] != "private":
@@ -416,8 +430,9 @@ async def update_group(
         fields["slug"] = sent["slug"]
 
     if fields:
+        casts = {"category_id": "uuid", "category_ids": "uuid[]"}
         sets = ", ".join(
-            f"{k} = cast(:{k} as uuid)" if k == "category_id" else f"{k} = :{k}" for k in fields
+            f"{k} = cast(:{k} as {casts[k]})" if k in casts else f"{k} = :{k}" for k in fields
         )
         await db.execute(
             text(f"update public.groups set {sets}, updated_at = now() where id = :id"),

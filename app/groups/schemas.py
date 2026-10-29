@@ -10,7 +10,8 @@ class GroupCreate(BaseModel):
     # Circles are always private. Communities default to public; "private" means
     # approval-based for a community.
     visibility: Optional[Literal["private", "public", "approval"]] = None
-    # A category id or slug.
+    # Category ids or slugs, primary first. `category_id` alone (older clients) sets just one.
+    category_ids: Optional[list[str]] = Field(default=None, max_length=10)
     category_id: Optional[str] = None
     university: Optional[str] = Field(default=None, max_length=120)
     cover_url: Optional[str] = Field(default=None, max_length=1000)
@@ -23,6 +24,8 @@ class GroupUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=2, max_length=60)
     description: Optional[str] = Field(default=None, max_length=500)
     visibility: Optional[Literal["private", "public", "approval"]] = None
+    # Replaces the categories (primary first); `category_id` alone swaps the primary.
+    category_ids: Optional[list[str]] = Field(default=None, max_length=10)
     category_id: Optional[str] = None
     university: Optional[str] = Field(default=None, max_length=120)
     cover_url: Optional[str] = Field(default=None, max_length=1000)
