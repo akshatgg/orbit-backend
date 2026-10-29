@@ -54,6 +54,12 @@ def _admin_title(g: dict) -> tuple[str, str]:
     return "moderator", "a moderator"
 
 
+def _last_admin(g: dict) -> str:
+    word, _ = _admin_title(g)
+    what = "circle" if g["kind"] == "circle" else "community"
+    return f"A {what} needs at least one {word}"
+
+
 # ─── discovery / CRUD ───────────────────────────────────────────────────────
 
 
@@ -630,7 +636,7 @@ async def remove_member(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Group admins only")
     target = str(user_id)
     if await _target_role(db, g["id"], target) == "admin" and await gs.admin_count(db, g["id"]) <= 1:
-        raise HTTPException(status.HTTP_409_CONFLICT, "A group needs at least one admin")
+        raise HTTPException(status.HTTP_409_CONFLICT, _last_admin(g))
     await db.execute(
         text("delete from public.group_members where group_id = :g and user_id = :u"),
         {"g": g["id"], "u": target},
@@ -654,7 +660,7 @@ async def set_member_role(
     target = str(user_id)
     current = await _target_role(db, g["id"], target)
     if current == "admin" and body.role == "member" and await gs.admin_count(db, g["id"]) <= 1:
-        raise HTTPException(status.HTTP_409_CONFLICT, "A group needs at least one admin")
+        raise HTTPException(status.HTTP_409_CONFLICT, _last_admin(g))
     await db.execute(
         text("update public.group_members set role = :r where group_id = :g and user_id = :u"),
         {"r": body.role, "g": g["id"], "u": target},
