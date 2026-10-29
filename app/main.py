@@ -16,6 +16,8 @@ from app.events.router import router as events_router
 from app.feed.router import router as feed_router
 from app.groups.router import router as groups_router
 from app.health.router import router as health_router
+from app.messaging.router import group_chat_router as messaging_groups_router
+from app.messaging.router import router as messaging_router
 from app.notifications.router import router as notifications_router
 from app.organisers.router import router as organisers_router
 from app.payments.router import router as payments_router
@@ -66,6 +68,8 @@ app.include_router(discovery_router, prefix=settings.API_PREFIX)
 app.include_router(organisers_router, prefix=settings.API_PREFIX)
 app.include_router(profiles_router, prefix=settings.API_PREFIX)
 app.include_router(groups_router, prefix=settings.API_PREFIX)
+app.include_router(messaging_groups_router, prefix=settings.API_PREFIX)
+app.include_router(messaging_router, prefix=settings.API_PREFIX)
 app.include_router(notifications_router, prefix=settings.API_PREFIX)
 app.include_router(studio_router, prefix=settings.API_PREFIX)
 app.include_router(payments_router, prefix=settings.API_PREFIX)

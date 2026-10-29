@@ -7,10 +7,16 @@ class GroupCreate(BaseModel):
     kind: Literal["circle", "community"]
     name: str = Field(min_length=2, max_length=60)
     description: Optional[str] = Field(default=None, max_length=500)
-    visibility: Literal["private", "public", "approval"] = "private"
+    # Circles are always private. Communities default to public; "private" means
+    # approval-based for a community.
+    visibility: Optional[Literal["private", "public", "approval"]] = None
+    # A category id or slug.
     category_id: Optional[str] = None
-    university: Optional[str] = None
-    cover_url: Optional[str] = None
+    university: Optional[str] = Field(default=None, max_length=120)
+    cover_url: Optional[str] = Field(default=None, max_length=1000)
+    # Communities only; generated from the name when blank.
+    slug: Optional[str] = Field(default=None, max_length=60)
+    allow_member_shares: Optional[bool] = None
 
 
 class GroupUpdate(BaseModel):
@@ -18,12 +24,18 @@ class GroupUpdate(BaseModel):
     description: Optional[str] = Field(default=None, max_length=500)
     visibility: Optional[Literal["private", "public", "approval"]] = None
     category_id: Optional[str] = None
-    university: Optional[str] = None
-    cover_url: Optional[str] = None
+    university: Optional[str] = Field(default=None, max_length=120)
+    cover_url: Optional[str] = Field(default=None, max_length=1000)
+    slug: Optional[str] = Field(default=None, max_length=60)
+    allow_member_shares: Optional[bool] = None
+
+
+class MemberRole(BaseModel):
+    role: Literal["admin", "member"]
 
 
 class InviteCreate(BaseModel):
-    email: Optional[str] = None
+    email: Optional[str] = Field(default=None, max_length=320)
     user_id: Optional[str] = None
 
 

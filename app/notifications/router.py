@@ -1,16 +1,19 @@
-"""Notification preferences and push subscriptions for the signed-in user."""
+"""Notification preferences, push subscriptions and the in-app inbox for the signed-in user."""
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.deps import require_user
+from app.core.pagination import CURSOR_LIMIT_MAX
+from app.notifications import inbox
 from app.notifications.channels import (
     StoredSubscription,
     delete_subscriptions,
@@ -161,3 +164,43 @@ async def push_test(
         await db.commit()
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "push_unreachable")
     return {"ok": True, **counts}
+
+
+# ─── in-app inbox (the bell) ────────────────────────────────────────────────
+
+
+@router.get("/notifications")
+async def list_notifications(
+    unread: bool = False,
+    limit: int = Query(20, ge=1, le=CURSOR_LIMIT_MAX),
+    cursor: Optional[str] = Query(None, max_length=500),
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_user),
+) -> dict[str, Any]:
+    """My notifications, newest first, with the unread count for the badge.
+
+    `unread=1` lists only unread ones. Pages by keyset: pass `next_cursor` back as `cursor`.
+    """
+    return await inbox.list_inbox(db, user["id"], unread_only=unread, limit=limit, cursor=cursor)
+
+
+@router.post("/notifications/read-all")
+async def read_all_notifications(
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_user),
+) -> dict[str, Any]:
+    """Mark every notification read."""
+    await inbox.mark_all_read(db, user["id"])
+    return {"ok": True, "unread_count": 0}
+
+
+@router.post("/notifications/{notification_id}/read")
+async def read_notification(
+    notification_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_user),
+) -> dict[str, Any]:
+    """Mark one notification read."""
+    if not await inbox.mark_read(db, user["id"], str(notification_id)):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Notification not found")
+    return {"ok": True, "unread_count": await inbox.unread_count(db, user["id"])}

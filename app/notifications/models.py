@@ -91,3 +91,53 @@ class NotificationLog(Base):
         ),
         Index("notification_log_event_idx", "event_id"),
     )
+
+
+class Notification(Base):
+    """The in-app inbox: one row per person per thing worth telling them.
+
+    Unlike `notification_log` (a push/email dedupe ledger tied to an event),
+    these are what the bell shows. `invite_id` lets an invite be answered inline.
+    """
+
+    __tablename__ = "notifications"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, default=uuid.uuid4, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[str | None] = mapped_column(Text)
+    link: Mapped[str | None] = mapped_column(Text)
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="SET NULL")
+    )
+    group_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("groups.id", ondelete="CASCADE")
+    )
+    invite_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("group_invites.id", ondelete="SET NULL")
+    )
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind in ('circle_invite','join_request','request_approved','event_shared','announcement')",
+            name="notifications_kind_check",
+        ),
+        Index("notifications_user_idx", "user_id", text("created_at desc"), text("id desc")),
+        Index(
+            "notifications_unread_idx",
+            "user_id",
+            text("created_at desc"),
+            postgresql_where=text("read_at is null"),
+        ),
+        Index("notifications_group_idx", "group_id"),
+        Index("notifications_invite_idx", "invite_id", postgresql_where=text("invite_id is not null")),
+    )

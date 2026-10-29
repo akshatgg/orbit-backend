@@ -16,7 +16,14 @@ from app.groups.models import (  # noqa: F401
     GroupInvite,
     GroupMember,
 )
+from app.messaging.models import (  # noqa: F401
+    Conversation,
+    ConversationMember,
+    Message,
+    UserBlock,
+)
 from app.notifications.models import (  # noqa: F401
+    Notification,
     NotificationLog,
     NotificationPreference,
     PushSubscription,
@@ -69,10 +76,15 @@ __all__ = [
     "PushSubscription",
     "NotificationPreference",
     "NotificationLog",
+    "Notification",
     "Group",
     "GroupMember",
     "GroupInvite",
     "GroupEvent",
     "GroupEventInterest",
     "GroupAnnouncement",
+    "Conversation",
+    "ConversationMember",
+    "Message",
+    "UserBlock",
 ]

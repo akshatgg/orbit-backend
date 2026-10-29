@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime, timedelta
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -50,6 +51,10 @@ class Group(Base):
     visibility: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'private'")
     )
+    # Communities only: whether any member may share an event, or only its admins.
+    allow_member_shares: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("users.id", ondelete="SET NULL")
     )
@@ -76,6 +81,7 @@ class Group(Base):
         ),
         Index("groups_kind_visibility_idx", "kind", "visibility"),
         Index("groups_category_idx", "category_id"),
+        Index("groups_kind_category_idx", "kind", "category_id"),
     )
 
 
@@ -102,7 +108,16 @@ class GroupMember(Base):
 
 
 class GroupInvite(Base):
-    """A targeted Circle invite (`invited_user_id`) or a shareable Community link (`code`)."""
+    """One way into a group, by `kind`:
+
+    * `invite`  — a member invited `invited_user_id`; only that person answers it.
+    * `request` — `invited_user_id` asked to join an approval community; only a
+      group admin answers it.
+    * `link`    — a shareable `code`; anyone with it joins until it expires.
+
+    A person holds at most one pending invite or request per group (partial
+    unique index).
+    """
 
     __tablename__ = "group_invites"
 
@@ -112,14 +127,12 @@ class GroupInvite(Base):
     group_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("groups.id", ondelete="CASCADE"), nullable=False
     )
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'invite'"))
     invited_user_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("users.id", ondelete="CASCADE")
     )
-    code: Mapped[str | None] = mapped_column(
-        Text,
-        unique=True,
-        default=lambda: uuid.uuid4().hex[:20],
-    )
+    # Only links carry a code; set explicitly when one is minted.
+    code: Mapped[str | None] = mapped_column(Text, unique=True)
     invited_by: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("users.id", ondelete="SET NULL")
     )
@@ -144,8 +157,16 @@ class GroupInvite(Base):
         CheckConstraint(
             "invited_user_id is not null or code is not null", name="group_invites_target_check"
         ),
+        CheckConstraint("kind in ('invite','request','link')", name="group_invites_kind_check"),
         Index("group_invites_group_idx", "group_id"),
         Index("group_invites_invited_idx", "invited_user_id"),
+        Index(
+            "group_invites_one_pending_idx",
+            "group_id",
+            "invited_user_id",
+            unique=True,
+            postgresql_where=text("status = 'pending' and invited_user_id is not null"),
+        ),
     )
 
 
