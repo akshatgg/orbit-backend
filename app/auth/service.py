@@ -12,7 +12,6 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.groups.service import join_auto_groups
 from app.core.security import (
     create_access_token,
     hash_password,
@@ -39,17 +38,13 @@ def normalize_email(email: str) -> str:
 async def get_or_create_user(
     db: AsyncSession, email: str, *, verified: bool = False, full_name: str | None = None
 ) -> User:
-    """Create `users` + `profiles` together; the pair is the account. A new account joins
-    every `auto_join` community."""
+    """Create `users` + `profiles` together; the pair is the account. Joining ORBIT's
+    community is offered at the end of onboarding, not done here."""
     email = normalize_email(email)
     values: dict[str, Any] = {"email": email}
     if verified:
         values["email_verified_at"] = text("now()")
-    created = (
-        await db.execute(
-            pg_insert(User).values(**values).on_conflict_do_nothing(index_elements=["email"]).returning(User.id)
-        )
-    ).first()
+    await db.execute(pg_insert(User).values(**values).on_conflict_do_nothing(index_elements=["email"]))
     user = (await db.execute(select(User).where(User.email == email))).scalar_one()
 
     await db.execute(
@@ -57,8 +52,6 @@ async def get_or_create_user(
         .values(id=user.id, email=email, full_name=full_name)
         .on_conflict_do_nothing(index_elements=["id"])
     )
-    if created:
-        await join_auto_groups(db, user.id)
     if settings.SUPER_ADMIN_EMAIL and email == normalize_email(settings.SUPER_ADMIN_EMAIL):
         await db.execute(
             text("update public.profiles set role = 'super_admin' where id = :id and role <> 'super_admin'"),
