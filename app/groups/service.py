@@ -506,8 +506,12 @@ def slugify(name: str) -> str:
     return slug[:50].strip("-") or "community"
 
 
+# Slugs the frontend's /communities routes use for pages of their own.
+RESERVED_SLUGS = {"new"}
+
+
 async def unique_slug(db: AsyncSession, base: str, exclude_id: Optional[str] = None) -> str:
-    taken = set(
+    taken = RESERVED_SLUGS | set(
         (
             await db.execute(
                 text(
