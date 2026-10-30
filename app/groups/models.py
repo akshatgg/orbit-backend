@@ -80,6 +80,10 @@ class Group(Base):
         Boolean, nullable=False, server_default=text("false")
     )
     auto_join: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    # Communities only: the organisation whose team runs it (null: ORBIT's own).
+    organiser_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("organisers.id", ondelete="SET NULL")
+    )
     # Channels only: the daily auto-post has looked at events created up to this moment.
     last_autopost_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_by: Mapped[uuid.UUID | None] = mapped_column(
@@ -112,11 +116,17 @@ class Group(Base):
         CheckConstraint(
             "slug is null or slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'", name="groups_slug_check"
         ),
+        CheckConstraint(
+            "organiser_id is null or kind = 'community'", name="groups_organiser_community_check"
+        ),
         Index("groups_kind_visibility_idx", "kind", "visibility"),
         Index("groups_category_idx", "category_id"),
         Index("groups_kind_category_idx", "kind", "category_id"),
         Index("groups_category_ids_idx", "category_ids", postgresql_using="gin"),
         Index("groups_parent_idx", "parent_id", postgresql_where=text("parent_id is not null")),
+        Index(
+            "groups_organiser_idx", "organiser_id", postgresql_where=text("organiser_id is not null")
+        ),
         Index(
             "groups_one_announcements_idx",
             "parent_id",

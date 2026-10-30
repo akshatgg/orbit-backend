@@ -67,6 +67,7 @@ alembic/versions/0001_baseline.py   the whole schema in one revision
 alembic/versions/0002_*.py          invite kinds, inbox, messaging (hand-written)
 alembic/versions/0003_*.py          communities link to several categories
 alembic/versions/0006_*.py          channels, chat attachments and links
+alembic/versions/0008_*.py          communities an organisation runs
 alembic/sql/orbit_functions.sql     generated from Orbit's Supabase migrations
 scripts/               extract_sql.py, dump_schema.sh, schema_diff.py,
                        seed_communities.py (the launch communities; idempotent),

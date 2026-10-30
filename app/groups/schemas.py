@@ -3,6 +3,15 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
+class StartingChannel(BaseModel):
+    """A channel a new community starts with; always public."""
+
+    name: str = Field(min_length=2, max_length=60)
+    description: Optional[str] = Field(default=None, max_length=500)
+    post_policy: Literal["everyone", "moderators"] = "everyone"
+    category_slugs: Optional[list[str]] = Field(default=None, max_length=10)
+
+
 class GroupCreate(BaseModel):
     kind: Literal["circle", "community"]
     name: str = Field(min_length=2, max_length=60)
@@ -18,6 +27,10 @@ class GroupCreate(BaseModel):
     # Communities only; generated from the name when blank.
     slug: Optional[str] = Field(default=None, max_length=60)
     allow_member_shares: Optional[bool] = None
+    # Communities only: the organisation that runs it (required unless an Orbit admin creates
+    # it), and the channels it starts with besides Announcements.
+    organiser_id: Optional[str] = None
+    channels: Optional[list[StartingChannel]] = Field(default=None, max_length=10)
 
 
 class ChannelCreate(BaseModel):
@@ -62,6 +75,10 @@ class InviteRespond(BaseModel):
 class ShareEvent(BaseModel):
     event_id: str
     note: Optional[str] = Field(default=None, max_length=300)
+
+
+class ShareEventMany(ShareEvent):
+    group_ids: list[str] = Field(min_length=1, max_length=20)
 
 
 class InterestBody(BaseModel):

@@ -4,9 +4,10 @@ One resource serves all three: `kind` decides the rules (see app/groups/service.
 for the access table). A Circle is private and invitation-driven; a Community
 is listed in the directory and is either open (join instantly) or
 approval-based; a Channel is a group inside a community, public, approval or
-private, with its own chat. Communities are created by Orbit admins; any
+private, with its own chat. Communities are created by Orbit admins and by the
+team of an approved organisation (up to three each), which then runs it; any
 signed-in user can create a Circle; channels are created by a community's
-moderators and Orbit admins.
+moderators, its organisation's team and Orbit admins.
 
 `{group_id}` accepts a group's id or, for communities and channels, its slug.
 """
@@ -28,6 +29,7 @@ from app.groups.schemas import (
     AnnouncementUpdate,
     ChannelCreate,
     GroupCreate,
+    ShareEventMany,
     GroupUpdate,
     InterestBody,
     InviteCreate,
@@ -109,9 +111,17 @@ async def create_group(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Create a Circle (anyone) or a Community (Orbit admins only). The creator is its admin."""
-    if body.kind == "community" and not gs.is_orbit_admin(user):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Communities are created by Orbit admins")
+    """Create a Circle (anyone) or a Community. The creator is its admin.
+
+    A community is created by an Orbit admin, with or without an organisation, or by an owner or
+    editor of an approved organisation (`organiser_id`), whose team then runs it; an organisation
+    has at most three (Orbit admins aren't held to it, 409 past it). It starts with its
+    Announcements channel (moderators post, everyone is in it) and the public `channels` given,
+    all in this one transaction. Returns the `GET /groups/{id}` card.
+    """
+    organiser_id = None
+    if body.kind == "community":
+        organiser_id = await _community_organiser(db, body.organiser_id, user)
     if body.kind == "circle":
         visibility, slug = "private", None
     else:
@@ -139,10 +149,11 @@ async def create_group(
                 """
                 insert into public.groups
                   (kind, name, slug, description, visibility, category_id, category_ids,
-                   university, cover_url, allow_member_shares, created_by)
+                   university, cover_url, allow_member_shares, organiser_id, created_by)
                 values (:kind, :name, :slug, :description, :visibility,
                         cast(:category_id as uuid), cast(:category_ids as uuid[]),
-                        :university, :cover_url, :allow_member_shares, :uid)
+                        :university, :cover_url, :allow_member_shares,
+                        cast(:organiser_id as uuid), :uid)
                 returning id
                 """
             ),
@@ -157,6 +168,7 @@ async def create_group(
                 "university": (body.university or "").strip() or None,
                 "cover_url": body.cover_url,
                 "allow_member_shares": True if body.allow_member_shares is None else body.allow_member_shares,
+                "organiser_id": organiser_id,
                 "uid": str(user["id"]),
             },
         )
@@ -175,7 +187,119 @@ async def create_group(
             ),
             {"g": group_id, "u": str(user["id"])},
         )
+    else:
+        await _add_channel(
+            db,
+            str(group_id),
+            user,
+            ChannelCreate(name="Announcements", post_policy="moderators"),
+            slug=f"{slug}-announcements",
+            announcements=True,
+        )
+        for channel in body.channels or []:
+            await _add_channel(db, str(group_id), user, ChannelCreate(**channel.model_dump()))
     return await get_group(str(group_id), user, db)
+
+
+async def _community_organiser(db: AsyncSession, ref: Optional[str], user: dict) -> Optional[str]:
+    """Who may create a community, and for which organisation: its id, or None for ORBIT's own.
+
+    The organisation's row is locked until the transaction ends, so two at once can't both
+    take its last place.
+    """
+    admin = gs.is_orbit_admin(user)
+    if not ref:
+        if admin:
+            return None
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Only approved organisations and ORBIT admins can create communities"
+        )
+    org = (
+        await db.execute(
+            text(
+                """
+                select o.id, o.status, m.role,
+                       (select count(*) from public.groups g
+                         where g.organiser_id = o.id and g.kind = 'community') as communities
+                  from public.organisers o
+                  left join public.organiser_members m on m.organiser_id = o.id and m.user_id = :u
+                 where o.id = :o
+                   for update of o
+                """
+            ),
+            {"o": gs.as_uuid(ref, "organisation id"), "u": str(user["id"])},
+        )
+    ).mappings().first()
+    if not org:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Organisation not found")
+    if not (admin or org["role"]):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Only the organisation's owners and editors can create its communities"
+        )
+    if org["status"] != "approved":
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "This organisation isn't approved yet, so it can't create a community",
+        )
+    if not admin and org["communities"] >= gs.COMMUNITIES_PER_ORGANISER:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"An organisation can run up to {gs.COMMUNITIES_PER_ORGANISER} communities",
+        )
+    return str(org["id"])
+
+
+@router.get("/creatable-organisers")
+async def creatable_organisers(
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """The organisations I'm on the team of, each with its communities, `community_count` and
+    `can_create` (approved and under the limit; Orbit admins aren't held to it), and
+    `is_orbit_admin` (who may also create one without an organisation). One query."""
+    admin = gs.is_orbit_admin(user)
+    rows = (
+        await db.execute(
+            text(
+                """
+                select o.id, o.slug, o.name, o.logo_url, o.is_verified, o.status, m.role,
+                       coalesce(c.items, '[]'::jsonb) as communities, coalesce(c.n, 0) as n
+                  from public.organiser_members m
+                  join public.organisers o on o.id = m.organiser_id
+                  left join lateral (
+                    select count(*) as n,
+                           jsonb_agg(jsonb_build_object('id', g.id, 'slug', g.slug, 'name', g.name)
+                                     order by g.created_at) as items
+                      from public.groups g
+                     where g.organiser_id = o.id and g.kind = 'community'
+                  ) c on true
+                 where m.user_id = :u
+                 order by lower(o.name), o.id
+                """
+            ),
+            {"u": str(user["id"])},
+        )
+    ).mappings().all()
+    return {
+        "is_orbit_admin": admin,
+        "limit": gs.COMMUNITIES_PER_ORGANISER,
+        "items": [
+            {
+                "id": str(r["id"]),
+                "slug": r["slug"],
+                "name": r["name"],
+                "logo_url": r["logo_url"],
+                "is_verified": r["is_verified"],
+                "status": r["status"],
+                "role": r["role"],
+                "community_count": int(r["n"]),
+                "communities": r["communities"],
+                "can_create": r["status"] == "approved"
+                and (admin or r["n"] < gs.COMMUNITIES_PER_ORGANISER),
+            }
+            for r in rows
+        ],
+    }
 
 
 @router.get("/invites/mine")
@@ -231,22 +355,26 @@ async def my_invites(
 @router.get("/shareable")
 async def shareable_groups(
     event_id: Optional[str] = None,
+    organiser_id: Optional[str] = None,
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """The circles, communities and channels I can share an event to, each with `already_shared`.
 
-    Channels come with their community's name, and only when I may post in them. Announcements
-    and communities that hold channels aren't listed: events go to a channel there.
+    Channels come with their community's id, slug and name, and only when I may post in them;
+    an Announcements channel only for those who manage it. Communities that hold channels aren't
+    listed: events go to a channel there. `organiser_id` keeps just the channels of the
+    communities that organisation runs (Studio's "share in your community").
     """
     eid = gs.as_uuid(event_id, "event id") if event_id else None
+    org = gs.as_uuid(organiser_id, "organisation id") if organiser_id else None
     rows = (
         await db.execute(
             text(
-                """
+                f"""
                 select g.id, g.kind, g.name, g.slug, g.cover_url, m.role as my_role,
                        g.parent_id, parent.slug as parent_slug, parent.name as parent_name,
-                       g.post_policy,
+                       g.post_policy, g.is_announcements,
                        (select count(*) from public.group_members mc where mc.group_id = g.id)
                          as member_count,
                        exists (select 1 from public.group_events ge
@@ -256,17 +384,20 @@ async def shareable_groups(
                   left join public.group_members m on m.group_id = g.id and m.user_id = :u
                   left join public.groups parent on parent.id = g.parent_id
                   left join public.group_members pm on pm.group_id = g.parent_id and pm.user_id = :u
-                 where not g.is_announcements
-                   and not exists (select 1 from public.groups ch where ch.parent_id = g.id)
+                  {gs.org_team_join("g", "parent", "cast(:u as uuid)")}
+                 where not exists (select 1 from public.groups ch where ch.parent_id = g.id)
+                   and (cast(:org as uuid) is null
+                        or (g.kind = 'channel' and parent.organiser_id = cast(:org as uuid)))
                    and ((m.role is not null
                          and (g.kind = 'circle' or m.role = 'admin'
                               or (g.allow_member_shares and g.post_policy = 'everyone')))
                         or (g.kind <> 'circle' and :orbit_admin)
-                        or pm.role = 'admin')
-                 order by (g.kind = 'circle') desc, lower(g.name), g.id
+                        or pm.role = 'admin' or org_team.role is not null)
+                 order by (g.kind = 'circle') desc, lower(parent.name) nulls first, parent.id,
+                          (not g.is_announcements), lower(g.name), g.id
                 """
             ),
-            {"u": str(user["id"]), "e": eid, "orbit_admin": gs.is_orbit_admin(user)},
+            {"u": str(user["id"]), "e": eid, "org": org, "orbit_admin": gs.is_orbit_admin(user)},
         )
     ).mappings().all()
     return {
@@ -282,6 +413,7 @@ async def shareable_groups(
                 "parent_slug": r["parent_slug"],
                 "parent_name": r["parent_name"],
                 "post_policy": r["post_policy"],
+                "is_announcements": r["is_announcements"],
                 "member_count": int(r["member_count"]),
                 "already_shared": bool(r["already_shared"]),
             }
@@ -527,11 +659,28 @@ async def create_channel(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Create a channel. The community's moderators and Orbit admins. The creator becomes its
-    admin and a member of the community."""
+    """Create a channel. The community's moderators, its organisation's team and Orbit admins.
+    The creator becomes its admin and a member of the community."""
     g, role = await _community(db, group_id, user)
     if not gs.can_manage(g, role, user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only moderators can create channels")
+    return await get_group(await _add_channel(db, g["id"], user, body), user, db)
+
+
+async def _add_channel(
+    db: AsyncSession,
+    community_id: str,
+    user: dict,
+    body: ChannelCreate,
+    *,
+    slug: Optional[str] = None,
+    announcements: bool = False,
+) -> str:
+    """A new channel in a community, with `user` as its admin (and a member of the community).
+    `announcements` makes it the community's Announcements: everyone who joins is in it.
+
+    Its daily auto-post starts from now, so the events of the day it was made are picked up.
+    """
     category_ids = await gs.resolve_categories(db, body.category_slugs or [])
     channel_id = (
         await db.execute(
@@ -539,27 +688,30 @@ async def create_channel(
                 """
                 insert into public.groups
                   (kind, parent_id, name, slug, description, visibility, post_policy,
-                   category_id, category_ids, created_by)
+                   category_id, category_ids, is_announcements, auto_join, last_autopost_at,
+                   created_by)
                 values ('channel', :parent, :name, :slug, :description, :visibility, :post_policy,
-                        cast(:category_id as uuid), cast(:category_ids as uuid[]), :uid)
+                        cast(:category_id as uuid), cast(:category_ids as uuid[]),
+                        :announcements, :announcements, now(), :uid)
                 returning id
                 """
             ),
             {
-                "parent": g["id"],
+                "parent": community_id,
                 "name": body.name.strip(),
-                "slug": await gs.unique_slug(db, gs.slugify(body.name)),
+                "slug": await gs.unique_slug(db, slug or gs.slugify(body.name)),
                 "description": body.description,
                 "visibility": body.visibility,
                 "post_policy": body.post_policy,
                 "category_id": category_ids[0] if category_ids else None,
                 "category_ids": category_ids,
+                "announcements": announcements,
                 "uid": str(user["id"]),
             },
         )
     ).scalar_one()
     await _make_member(db, str(channel_id), str(user["id"]), "admin")
-    return await get_group(str(channel_id), user, db)
+    return str(channel_id)
 
 
 @router.patch("/{group_id}")
@@ -1299,12 +1451,69 @@ async def share_event(
     """
     g = await gs.resolve(db, group_id, user)
     role = await gs.role_of(db, g["id"], user)
-    if not gs.can_share(g, role, user):
-        if role:
-            where = "channel" if g["kind"] == "channel" else "community"
-            raise HTTPException(status.HTTP_403_FORBIDDEN, f"Only admins can share to this {where}")
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Join this group to share with it")
-    event_id = gs.as_uuid(body.event_id, "event id")
+    _may_share(g, role, user)
+    event = await _shareable_event(db, body.event_id)
+    inserted = await _share(db, g, user, event, body.note)
+    return {
+        "group_id": g["id"],
+        "event_id": event["id"],
+        "shared": True,
+        "already_shared": not inserted,
+    }
+
+
+@router.post("/share-event")
+async def share_event_many(
+    body: ShareEventMany,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Share one event with up to 20 groups at once, by the same rules as one at a time.
+
+    Each group answers on its own in `items` (in the order given): `shared`, `already_shared`,
+    `forbidden` (with the reason in `error`) or `not_found`, so one group that can't take it
+    doesn't stop the rest. The event itself must be published, upcoming and visible (404 / 422
+    for the whole call).
+    """
+    event = await _shareable_event(db, body.event_id)
+    items = []
+    for ref in dict.fromkeys(body.group_ids):
+        try:
+            g = await gs.resolve(db, ref, user)
+            _may_share(g, await gs.role_of(db, g["id"], user), user)
+        except HTTPException as exc:
+            items.append(
+                {
+                    "group_id": ref,
+                    "status": "not_found" if exc.status_code == 404 else "forbidden",
+                    "error": exc.detail,
+                }
+            )
+            continue
+        inserted = await _share(db, g, user, event, body.note)
+        items.append(
+            {"group_id": g["id"], "name": g["name"], "status": "shared" if inserted else "already_shared"}
+        )
+    return {
+        "event_id": event["id"],
+        "items": items,
+        "shared": sum(i["status"] == "shared" for i in items),
+    }
+
+
+def _may_share(g: dict, role: Optional[str], user: dict) -> None:
+    if gs.can_share(g, role, user):
+        return
+    if role:
+        where = "channel" if g["kind"] == "channel" else "community"
+        raise HTTPException(status.HTTP_403_FORBIDDEN, f"Only admins can share to this {where}")
+    raise HTTPException(status.HTTP_403_FORBIDDEN, "Join this group to share with it")
+
+
+async def _shareable_event(db: AsyncSession, ref: str) -> dict:
+    """The event's id and title; 404 when it doesn't exist, 422 unless it's published, upcoming
+    and visible."""
+    event_id = gs.as_uuid(ref, "event id")
     event = (
         await db.execute(
             text(
@@ -1325,17 +1534,23 @@ async def share_event(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "Only published, upcoming events can be shared"
         )
+    return {"id": event_id, "title": event["title"]}
+
+
+async def _share(db: AsyncSession, g: dict, user: dict, event: dict, note: Optional[str]) -> bool:
+    """Shares `event` with `g` (already allowed): a channel's chat gets the event message, a
+    circle's members the bell. False when it was shared there already."""
     inserted = (
         await db.execute(
             text(
                 "insert into public.group_events (group_id, event_id, shared_by, note)"
                 " values (:g, :e, :u, :n) on conflict do nothing returning event_id"
             ),
-            {"g": g["id"], "e": event_id, "u": str(user["id"]), "n": body.note},
+            {"g": g["id"], "e": event["id"], "u": str(user["id"]), "n": note},
         )
     ).first()
     if inserted and g["kind"] == "channel":
-        await ms.post_shared_event(db, g, event_id, str(user["id"]), body.note)
+        await ms.post_shared_event(db, g, event["id"], str(user["id"]), note)
     if inserted and g["kind"] == "circle":
         await inbox.notify_group(
             db,
@@ -1346,12 +1561,7 @@ async def share_event(
             link=gs.group_path(g),
             actor_id=str(user["id"]),
         )
-    return {
-        "group_id": g["id"],
-        "event_id": event_id,
-        "shared": True,
-        "already_shared": inserted is None,
-    }
+    return inserted is not None
 
 
 @router.delete("/{group_id}/events/{event_id}", status_code=204)
