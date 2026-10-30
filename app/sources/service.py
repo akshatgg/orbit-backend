@@ -30,6 +30,7 @@ from app.connectors.registry import CONNECTORS
 from app.connectors.timezone import local_day
 from app.core.database import AsyncSessionLocal, engine
 from app.events.models import Event
+from app.cron.autopost import run_autopost
 from app.sources.classify import classify_event
 from app.sources.duplicates import certain_duplicate, find_duplicates, pair_key
 from app.sources.enrich import (
@@ -748,6 +749,7 @@ async def refresh_all_sources(trigger: str = "cron") -> dict[str, Any]:
     expired = 0
     duplicates_flagged = 0
     run = RunState(deadline=int(time.time() * 1000) + RUN_ENRICH_DEADLINE_MS)
+    autopost: dict[str, Any] = {}
 
     # One connection holds the session-level lock for the whole refresh.
     async with engine.connect() as lock:
@@ -786,6 +788,9 @@ async def refresh_all_sources(trigger: str = "cron") -> dict[str, Any]:
                 except Exception as exc:  # noqa: BLE001
                     await db.rollback()
                     errors.append(f"Duplicate check: {db_message(exc)}")
+
+            # Its own transaction, and it never raises: the import has already succeeded or not.
+            autopost = await run_autopost()
         finally:
             await lock.execute(text("select pg_advisory_unlock(hashtext(:k))"), {"k": REFRESH_LOCK})
             await lock.commit()
@@ -798,6 +803,7 @@ async def refresh_all_sources(trigger: str = "cron") -> dict[str, Any]:
         "expired": expired,
         "duplicates_flagged": duplicates_flagged,
         "errors": errors,
+        "autopost": autopost,
     }
     logger.info(
         "Source refresh (%s) finished: ok=%s sources=%d expired=%d duplicates=%d errors=%s",
