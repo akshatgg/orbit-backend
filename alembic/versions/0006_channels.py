@@ -198,6 +198,7 @@ def upgrade() -> None:
             sa.Column("bytes", sa.BigInteger(), nullable=True),
             sa.Column("width", sa.Integer(), nullable=True),
             sa.Column("height", sa.Integer(), nullable=True),
+            sa.Column("position", sa.SmallInteger(), nullable=False, server_default=sa.text("0")),
             sa.Column(
                 "created_at", postgresql.TIMESTAMP(timezone=True), nullable=False, server_default=sa.func.now()
             ),

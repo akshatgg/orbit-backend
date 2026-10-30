@@ -96,15 +96,15 @@ async def save(db: AsyncSession, message_id: str, conversation_id: str, items: l
         text(
             """
             insert into public.message_attachments
-              (message_id, conversation_id, kind, url, public_id, name, mime, bytes, width, height)
-            select :m, :c, x.kind, x.url, x.public_id, x.name, x.mime, x.bytes, x.width, x.height
+              (message_id, conversation_id, kind, url, public_id, name, mime, bytes, width, height, position)
+            select :m, :c, x.kind, x.url, x.public_id, x.name, x.mime, x.bytes, x.width, x.height, x.position
               from jsonb_to_recordset(cast(:rows as jsonb)) as x(
                 kind text, url text, public_id text, name text, mime text,
-                bytes bigint, width int, height int
+                bytes bigint, width int, height int, position smallint
               )
             """
         ),
-        {"m": message_id, "c": conversation_id, "rows": json.dumps([i.model_dump() for i in items])},
+        {"m": message_id, "c": conversation_id, "rows": json.dumps([{**i.model_dump(), "position": n} for n, i in enumerate(items)])},
     )
 
 

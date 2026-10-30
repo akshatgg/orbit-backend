@@ -344,6 +344,15 @@ async def fill_previews(db: AsyncSession, links: list[tuple[str, str]]) -> None:
                 "image_url": found.get("image_url"),
             },
         )
+    # So an open thread's next poll picks the previews up through `changed`.
+    await db.execute(
+        text(
+            "update public.messages m set updated_at = now()"
+            " from public.message_links l"
+            " where l.id = any(cast(:ids as uuid[])) and m.id = l.message_id and m.deleted_at is null"
+        ),
+        {"ids": [link_id for link_id, _ in links]},
+    )
 
 
 def link_out(r: Any) -> dict[str, Any]:

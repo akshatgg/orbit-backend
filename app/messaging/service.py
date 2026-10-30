@@ -164,7 +164,7 @@ async def messages_out(
             await db.execute(
                 text(
                     "select * from public.message_attachments where message_id = any(cast(:ids as uuid[]))"
-                    " order by created_at, id"
+                    " order by position, id"
                 ),
                 {"ids": media},
             )

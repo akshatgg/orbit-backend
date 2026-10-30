@@ -28,6 +28,7 @@ from sqlalchemy import (
     Identity,
     Index,
     Integer,
+    SmallInteger,
     Text,
     UniqueConstraint,
     Uuid,
@@ -182,6 +183,8 @@ class MessageAttachment(Base):
     bytes: Mapped[int | None] = mapped_column(BigInteger)
     width: Mapped[int | None] = mapped_column(Integer)
     height: Mapped[int | None] = mapped_column(Integer)
+    # Its place in the message, as sent: one message's attachments share a created_at.
+    position: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
