@@ -895,3 +895,130 @@ async def retract_shared_event(db: AsyncSession, group_id: str, event_id: str) -
         ),
         {"g": group_id, "e": event_id},
     )
+
+
+# ─── the library: Media, Links and Docs ─────────────────────────────────────
+
+
+async def library(
+    db: AsyncSession,
+    conversation_id: str,
+    me: str,
+    *,
+    tab: str,
+    q: Optional[str],
+    limit: int,
+    cursor: Optional[str],
+) -> dict[str, Any]:
+    """Newest first, keyset on (created_at, id). `q` matches name and url, or for links title,
+    url and domain. Deleted messages and people I blocked are left out. Links are link rows plus
+    event messages, each branch ordered and limited on its own, so both start at the cursor."""
+    params: dict[str, Any] = {"c": conversation_id, "me": me, "limit": limit + 1}
+    after = decode_cursor(cursor, "tu")
+    if q and q.strip():
+        params["q"] = f"%{escape_like(q.strip().lower())}%"
+    if tab == "links":
+        rows = (await db.execute(text(_library_links(params, after)), params)).mappings().all()
+    else:
+        params["kind"] = "image" if tab == "media" else "doc"
+        rows = (await db.execute(text(_library_files(params, after)), params)).mappings().all()
+    more = len(rows) > limit
+    rows = rows[:limit]
+    cards = await _event_cards(
+        db, list({str(r["event_id"]) for r in rows if r.get("event_id")})
+    )
+    items = []
+    for r in rows:
+        item: dict[str, Any] = {
+            "id": str(r["id"]),
+            "message_id": str(r["message_id"]),
+            "sender": user_brief(r, "s_"),
+            "created_at": r["created_at"],
+        }
+        if tab != "links":
+            item.update(files.attachment_out(r))
+        elif r["item_type"] == "event":
+            item.update(
+                type="event",
+                url=f"/events/{r['event_id']}",
+                domain=None,
+                title=r["title"],
+                description=None,
+                image_url=None,
+                event=cards.get(str(r["event_id"])),
+            )
+        else:
+            item.update(type="link", event=None, **{k: v for k, v in message_links.link_out(r).items() if k != "id"})
+        items.append(item)
+    next_cursor = encode_cursor(rows[-1]["created_at"], rows[-1]["id"]) if more and rows else None
+    return {"items": items, "next_cursor": next_cursor, "page_size": limit}
+
+
+def _keyset(alias: str, params: dict[str, Any], after: Optional[list[Any]]) -> str:
+    if not after:
+        return ""
+    params.update(c_at=after[0], c_id=after[1])
+    return f" and ({alias}.created_at, {alias}.id) < (:c_at, cast(:c_id as uuid))"
+
+
+def _library_files(params: dict[str, Any], after: Optional[list[Any]]) -> str:
+    search = ""
+    if "q" in params:
+        search = " and (lower(a.name) like :q escape '\\' or lower(a.url) like :q escape '\\')"
+    return f"""
+        select a.id, a.message_id, a.kind, a.url, a.public_id, a.name, a.mime, a.bytes,
+               a.width, a.height, a.created_at, {user_columns("m.sender_id", "p", "s_")}
+          from public.message_attachments a
+          join public.messages m on m.id = a.message_id
+          left join public.profiles p on p.id = m.sender_id
+         where a.conversation_id = :c and a.kind = :kind and m.deleted_at is null
+           and {NOT_BLOCKED_SENDER}{_keyset("a", params, after)}{search}
+         order by a.created_at desc, a.id desc
+         limit :limit
+    """
+
+
+def _library_links(params: dict[str, Any], after: Optional[list[Any]]) -> str:
+    link_search = event_search = ""
+    if "q" in params:
+        link_search = (
+            " and (lower(l.url) like :q escape '\\' or lower(l.title) like :q escape '\\'"
+            " or lower(l.domain) like :q escape '\\')"
+        )
+        event_search = " and lower(e.title) like :q escape '\\'"
+    return f"""
+        select * from (
+          (select 'link' as item_type, l.id, l.message_id, l.created_at, l.url, l.domain, l.title,
+                  l.description, l.image_url, null::uuid as event_id,
+                  {user_columns("m.sender_id", "p", "s_")}
+             from public.message_links l
+             join public.messages m on m.id = l.message_id
+             left join public.profiles p on p.id = m.sender_id
+            where l.conversation_id = :c and m.deleted_at is null
+              and {NOT_BLOCKED_SENDER}{_keyset("l", params, after)}{link_search}
+            order by l.created_at desc, l.id desc
+            limit :limit)
+          union all
+          (select 'event', m.id, m.id, m.created_at, null, null, e.title, null, null, m.event_id,
+                  {user_columns("m.sender_id", "p", "s_")}
+             from public.messages m
+             join public.events e on e.id = m.event_id
+             left join public.organisers o on o.id = e.organiser_id
+             left join public.profiles p on p.id = m.sender_id
+            where m.conversation_id = :c and m.kind = 'event' and m.deleted_at is null
+              and e.status in ('published', 'cancelled', 'expired') and {EVENT_VISIBLE}
+              and {NOT_BLOCKED_SENDER}{_keyset("m", params, after)}{event_search}
+            order by m.created_at desc, m.id desc
+            limit :limit)
+        ) x
+        order by x.created_at desc, x.id desc
+        limit :limit
+    """
+
+
+async def _push(db: AsyncSession, user_id: UUID, message: Any) -> None:
+    recipients = await load_recipients(db, [user_id])
+    if "push" not in channels_for(user_id, recipients.prefs(user_id), recipients, channels_available()):
+        return
+    sent = await send_push(recipients.subscriptions.get(user_id, []), message)
+    await delete_subscriptions(db, sent.expired_endpoints)

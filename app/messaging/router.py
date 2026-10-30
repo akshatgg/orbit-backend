@@ -185,6 +185,26 @@ async def send_message(
     return await ms.send(db, c, user, body.body, body.attachments)
 
 
+@router.get("/conversations/{conversation_id}/library")
+async def conversation_library(
+    conversation_id: UUID,
+    tab: str = Query("media", pattern="^(media|links|docs)$"),
+    q: Optional[str] = Query(None, max_length=100),
+    limit: int = Query(30, ge=1, le=CURSOR_LIMIT_MAX),
+    cursor: Optional[str] = Query(None, max_length=500),
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """A thread's Media, Links or Docs, newest first. Same access as reading the thread.
+
+    Pages by keyset: pass `next_cursor` back as `cursor`.
+    """
+    await ms.open_conversation(db, conversation_id, str(user["id"]))
+    return await ms.library(
+        db, str(conversation_id), str(user["id"]), tab=tab, q=q, limit=limit, cursor=cursor
+    )
+
+
 @router.post("/conversations/{conversation_id}/read")
 async def read_conversation(
     conversation_id: UUID,
