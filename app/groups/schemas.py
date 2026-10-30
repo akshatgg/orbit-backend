@@ -77,6 +77,10 @@ class ShareEvent(BaseModel):
     note: Optional[str] = Field(default=None, max_length=300)
 
 
+class ShareEventMany(ShareEvent):
+    group_ids: list[str] = Field(min_length=1, max_length=20)
+
+
 class InterestBody(BaseModel):
     status: Literal["interested", "going"] = "interested"
 

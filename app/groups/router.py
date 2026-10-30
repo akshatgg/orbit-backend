@@ -29,6 +29,7 @@ from app.groups.schemas import (
     AnnouncementUpdate,
     ChannelCreate,
     GroupCreate,
+    ShareEventMany,
     GroupUpdate,
     InterestBody,
     InviteCreate,
@@ -354,22 +355,26 @@ async def my_invites(
 @router.get("/shareable")
 async def shareable_groups(
     event_id: Optional[str] = None,
+    organiser_id: Optional[str] = None,
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """The circles, communities and channels I can share an event to, each with `already_shared`.
 
-    Channels come with their community's name, and only when I may post in them. Announcements
-    and communities that hold channels aren't listed: events go to a channel there.
+    Channels come with their community's id, slug and name, and only when I may post in them;
+    an Announcements channel only for those who manage it. Communities that hold channels aren't
+    listed: events go to a channel there. `organiser_id` keeps just the channels of the
+    communities that organisation runs (Studio's "share in your community").
     """
     eid = gs.as_uuid(event_id, "event id") if event_id else None
+    org = gs.as_uuid(organiser_id, "organisation id") if organiser_id else None
     rows = (
         await db.execute(
             text(
-                """
+                f"""
                 select g.id, g.kind, g.name, g.slug, g.cover_url, m.role as my_role,
                        g.parent_id, parent.slug as parent_slug, parent.name as parent_name,
-                       g.post_policy,
+                       g.post_policy, g.is_announcements,
                        (select count(*) from public.group_members mc where mc.group_id = g.id)
                          as member_count,
                        exists (select 1 from public.group_events ge
@@ -379,17 +384,20 @@ async def shareable_groups(
                   left join public.group_members m on m.group_id = g.id and m.user_id = :u
                   left join public.groups parent on parent.id = g.parent_id
                   left join public.group_members pm on pm.group_id = g.parent_id and pm.user_id = :u
-                 where not g.is_announcements
-                   and not exists (select 1 from public.groups ch where ch.parent_id = g.id)
+                  {gs.org_team_join("g", "parent", "cast(:u as uuid)")}
+                 where not exists (select 1 from public.groups ch where ch.parent_id = g.id)
+                   and (cast(:org as uuid) is null
+                        or (g.kind = 'channel' and parent.organiser_id = cast(:org as uuid)))
                    and ((m.role is not null
                          and (g.kind = 'circle' or m.role = 'admin'
                               or (g.allow_member_shares and g.post_policy = 'everyone')))
                         or (g.kind <> 'circle' and :orbit_admin)
-                        or pm.role = 'admin')
-                 order by (g.kind = 'circle') desc, lower(g.name), g.id
+                        or pm.role = 'admin' or org_team.role is not null)
+                 order by (g.kind = 'circle') desc, lower(parent.name) nulls first, parent.id,
+                          (not g.is_announcements), lower(g.name), g.id
                 """
             ),
-            {"u": str(user["id"]), "e": eid, "orbit_admin": gs.is_orbit_admin(user)},
+            {"u": str(user["id"]), "e": eid, "org": org, "orbit_admin": gs.is_orbit_admin(user)},
         )
     ).mappings().all()
     return {
@@ -405,6 +413,7 @@ async def shareable_groups(
                 "parent_slug": r["parent_slug"],
                 "parent_name": r["parent_name"],
                 "post_policy": r["post_policy"],
+                "is_announcements": r["is_announcements"],
                 "member_count": int(r["member_count"]),
                 "already_shared": bool(r["already_shared"]),
             }
@@ -1442,12 +1451,69 @@ async def share_event(
     """
     g = await gs.resolve(db, group_id, user)
     role = await gs.role_of(db, g["id"], user)
-    if not gs.can_share(g, role, user):
-        if role:
-            where = "channel" if g["kind"] == "channel" else "community"
-            raise HTTPException(status.HTTP_403_FORBIDDEN, f"Only admins can share to this {where}")
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Join this group to share with it")
-    event_id = gs.as_uuid(body.event_id, "event id")
+    _may_share(g, role, user)
+    event = await _shareable_event(db, body.event_id)
+    inserted = await _share(db, g, user, event, body.note)
+    return {
+        "group_id": g["id"],
+        "event_id": event["id"],
+        "shared": True,
+        "already_shared": not inserted,
+    }
+
+
+@router.post("/share-event")
+async def share_event_many(
+    body: ShareEventMany,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Share one event with up to 20 groups at once, by the same rules as one at a time.
+
+    Each group answers on its own in `items` (in the order given): `shared`, `already_shared`,
+    `forbidden` (with the reason in `error`) or `not_found`, so one group that can't take it
+    doesn't stop the rest. The event itself must be published, upcoming and visible (404 / 422
+    for the whole call).
+    """
+    event = await _shareable_event(db, body.event_id)
+    items = []
+    for ref in dict.fromkeys(body.group_ids):
+        try:
+            g = await gs.resolve(db, ref, user)
+            _may_share(g, await gs.role_of(db, g["id"], user), user)
+        except HTTPException as exc:
+            items.append(
+                {
+                    "group_id": ref,
+                    "status": "not_found" if exc.status_code == 404 else "forbidden",
+                    "error": exc.detail,
+                }
+            )
+            continue
+        inserted = await _share(db, g, user, event, body.note)
+        items.append(
+            {"group_id": g["id"], "name": g["name"], "status": "shared" if inserted else "already_shared"}
+        )
+    return {
+        "event_id": event["id"],
+        "items": items,
+        "shared": sum(i["status"] == "shared" for i in items),
+    }
+
+
+def _may_share(g: dict, role: Optional[str], user: dict) -> None:
+    if gs.can_share(g, role, user):
+        return
+    if role:
+        where = "channel" if g["kind"] == "channel" else "community"
+        raise HTTPException(status.HTTP_403_FORBIDDEN, f"Only admins can share to this {where}")
+    raise HTTPException(status.HTTP_403_FORBIDDEN, "Join this group to share with it")
+
+
+async def _shareable_event(db: AsyncSession, ref: str) -> dict:
+    """The event's id and title; 404 when it doesn't exist, 422 unless it's published, upcoming
+    and visible."""
+    event_id = gs.as_uuid(ref, "event id")
     event = (
         await db.execute(
             text(
@@ -1468,17 +1534,23 @@ async def share_event(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "Only published, upcoming events can be shared"
         )
+    return {"id": event_id, "title": event["title"]}
+
+
+async def _share(db: AsyncSession, g: dict, user: dict, event: dict, note: Optional[str]) -> bool:
+    """Shares `event` with `g` (already allowed): a channel's chat gets the event message, a
+    circle's members the bell. False when it was shared there already."""
     inserted = (
         await db.execute(
             text(
                 "insert into public.group_events (group_id, event_id, shared_by, note)"
                 " values (:g, :e, :u, :n) on conflict do nothing returning event_id"
             ),
-            {"g": g["id"], "e": event_id, "u": str(user["id"]), "n": body.note},
+            {"g": g["id"], "e": event["id"], "u": str(user["id"]), "n": note},
         )
     ).first()
     if inserted and g["kind"] == "channel":
-        await ms.post_shared_event(db, g, event_id, str(user["id"]), body.note)
+        await ms.post_shared_event(db, g, event["id"], str(user["id"]), note)
     if inserted and g["kind"] == "circle":
         await inbox.notify_group(
             db,
@@ -1489,12 +1561,7 @@ async def share_event(
             link=gs.group_path(g),
             actor_id=str(user["id"]),
         )
-    return {
-        "group_id": g["id"],
-        "event_id": event_id,
-        "shared": True,
-        "already_shared": inserted is None,
-    }
+    return inserted is not None
 
 
 @router.delete("/{group_id}/events/{event_id}", status_code=204)
