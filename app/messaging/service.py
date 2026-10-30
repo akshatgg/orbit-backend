@@ -31,7 +31,7 @@ from app.core.pagination import decode_cursor, encode_cursor
 from app.events.models import Event
 from app.events.service import card as event_card
 from app.events.service import card_query, escape_like, with_counts
-from app.groups.service import EVENT_VISIBLE, ORBIT_ADMIN_ROLES, group_path
+from app.groups.service import EVENT_VISIBLE, ORBIT_ADMIN_ROLES, group_path, org_team_join
 from app.messaging import attachments as files
 from app.messaging import links as message_links
 from app.messaging.schemas import AttachmentIn
@@ -370,7 +370,7 @@ async def open_conversation(db: AsyncSession, conversation_id: UUID, me: str) ->
                        g.auto_join, g.parent_id,
                        parent.slug as parent_slug, parent.name as parent_name,
                        gm.created_at as joined_at, gm.role as my_role, pm.role as parent_role,
-                       mine.role as orbit_role,
+                       org_team.role as org_role, mine.role as orbit_role,
                        (c.user_a = cast(:me as uuid) or c.user_b = cast(:me as uuid)) as participant,
                        {user_columns("x.other_id", "op", "o_")},
                        exists (
@@ -390,6 +390,7 @@ async def open_conversation(db: AsyncSession, conversation_id: UUID, me: str) ->
                     on gm.group_id = c.group_id and gm.user_id = cast(:me as uuid)
                   left join public.group_members pm
                     on pm.group_id = g.parent_id and pm.user_id = cast(:me as uuid)
+                  {org_team_join("g", "parent", "cast(:me as uuid)")}
                   left join public.profiles mine on mine.id = cast(:me as uuid)
                   left join public.profiles op on op.id = x.other_id
                  where c.id = :id
@@ -412,10 +413,14 @@ async def open_conversation(db: AsyncSession, conversation_id: UUID, me: str) ->
 
 
 def can_moderate(c: dict[str, Any]) -> bool:
-    """A channel's managers (its admins, its community's admins, Orbit admins) may delete
-    anyone's message and post whatever its `post_policy`. Circles and direct messages have none."""
+    """A channel's managers (its admins, its community's admins and organisation team, Orbit
+    admins) may delete anyone's message and post whatever its `post_policy`. Circles and direct
+    messages have none."""
     return c["kind"] == "channel" and (
-        c["my_role"] == "admin" or c["parent_role"] == "admin" or c["orbit_role"] in ORBIT_ADMIN_ROLES
+        c["my_role"] == "admin"
+        or c["parent_role"] == "admin"
+        or c["org_role"] is not None
+        or c["orbit_role"] in ORBIT_ADMIN_ROLES
     )
 
 
@@ -775,15 +780,18 @@ async def delete(db: AsyncSession, message_id: UUID, me: dict) -> None:
     row = (
         await db.execute(
             text(
-                """
-                select m.sender_id, m.deleted_at, c.kind, gm.role as my_role, pm.role as parent_role
+                f"""
+                select m.sender_id, m.deleted_at, c.kind, gm.role as my_role, pm.role as parent_role,
+                       org_team.role as org_role
                   from public.messages m
                   join public.conversations c on c.id = m.conversation_id
                   left join public.groups g on g.id = c.group_id
+                  left join public.groups parent on parent.id = g.parent_id
                   left join public.group_members gm
                     on gm.group_id = c.group_id and gm.user_id = cast(:me as uuid)
                   left join public.group_members pm
                     on pm.group_id = g.parent_id and pm.user_id = cast(:me as uuid)
+                  {org_team_join("g", "parent", "cast(:me as uuid)")}
                  where m.id = :id
                 """
             ),

@@ -10,11 +10,14 @@ Who may do what (the router enforces it through these helpers):
 | read the chat | members | no chat | members (a manager joins first) |
 | post in the chat | members | no chat | members; `post_policy='moderators'`: managers |
 | read announcements | members | members (and Orbit admins) | members (and managers) |
-| manage (edit, invites list, roles, delete) | group admins | group admins and Orbit admins | its admins, its community's admins and Orbit admins |
+| manage (edit, invites list, roles, delete) | group admins | group admins, its organisation's team and Orbit admins | its admins, its community's admins and organisation's team, and Orbit admins |
 | invite by email / mint a link | any member | group admins and Orbit admins | managers |
 | share an event | any member | members if `allow_member_shares`, else admins | as a community, and only managers under `post_policy='moderators'` |
 
 Orbit admins get no special access to Circles: they are private friend groups.
+
+A community an organisation runs (`organiser_id`) is managed by that organisation's team too
+(its owners and editors, while it's approved), and so are its channels: `org_role`.
 
 Joining a channel joins its community. Leaving or being removed from a community leaves
 all its channels. An `auto_join` channel can't be left on its own.
@@ -42,6 +45,8 @@ from app.events.service import card_query, escape_like, with_counts
 from app.users.brief import user_brief, user_columns
 
 ORBIT_ADMIN_ROLES = ("admin", "super_admin")
+# Orbit admins aren't held to it.
+COMMUNITIES_PER_ORGANISER = 3
 SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 AVATARS_PER_EVENT = 8
 
@@ -49,6 +54,19 @@ AVATARS_PER_EVENT = 8
 EVENT_VISIBLE = "(e.organiser_id is null or o.status = 'approved')"
 UPCOMING = "coalesce(e.ends_at, e.starts_at) >= now()"
 LISTED = ("public", "approval")
+
+
+def org_team_join(group: str, parent: str, uid: str) -> str:
+    """Joins `org_team.role`: the caller's role in the approved organisation that runs this
+    community (or this channel's community), else null. `group` and `parent` are aliases of
+    the group and its community, `uid` the caller's id as SQL."""
+    return f"""
+      left join lateral (
+        select om.role from public.organiser_members om
+          join public.organisers org on org.id = om.organiser_id and org.status = 'approved'
+         where om.organiser_id = coalesce({group}.organiser_id, {parent}.organiser_id)
+           and om.user_id = {uid}
+      ) org_team on true"""
 
 # Events a community picks up by itself: published, not a duplicate, in one of its
 # categories and (when set) its university. Bound as :categories / :university from the group.
@@ -66,6 +84,8 @@ select p.id, p.kind, p.name, p.slug, p.description, p.cover_url, p.university,
        p.allow_member_shares, p.created_by, p.created_at, p.my_role,
        p.parent_id, parent.slug as parent_slug, parent.name as parent_name,
        p.post_policy, p.is_announcements, p.auto_join,
+       org.id as org_id, org.slug as org_slug, org.name as org_name, org.logo_url as org_logo_url,
+       org.is_verified as org_is_verified,
        mc.n as member_count,
        shared.n + matched.n as upcoming_event_count,
        pr.pending as pending_request,
@@ -73,6 +93,8 @@ select p.id, p.kind, p.name, p.slug, p.description, p.cover_url, p.university,
   from page p
   left join public.categories c on c.id = p.category_id
   left join public.groups parent on parent.id = p.parent_id
+  left join public.organisers org
+    on org.id = coalesce(p.organiser_id, parent.organiser_id) and org.status = 'approved'
   cross join lateral (
     select count(*) as n from public.group_members m where m.group_id = p.id
   ) mc
@@ -115,8 +137,20 @@ def is_orbit_admin(user: Optional[dict]) -> bool:
 
 
 def group_out(row: Any) -> dict[str, Any]:
-    """The group card every endpoint returns."""
+    """The group card every endpoint returns. `organiser` is the organisation that runs a
+    community (`parent_organiser` its channels'), while it's approved."""
     r = dict(row)
+    organiser = (
+        {
+            "id": str(r["org_id"]),
+            "slug": r["org_slug"],
+            "name": r["org_name"],
+            "logo_url": r["org_logo_url"],
+            "is_verified": bool(r["org_is_verified"]),
+        }
+        if r["org_id"]
+        else None
+    )
     return {
         "id": str(r["id"]),
         "kind": r["kind"],
@@ -147,6 +181,8 @@ def group_out(row: Any) -> dict[str, Any]:
         "post_policy": r["post_policy"],
         "is_announcements": r["is_announcements"],
         "auto_join": r["auto_join"],
+        "organiser": organiser if r["kind"] == "community" else None,
+        "parent_organiser": organiser if r["kind"] == "channel" else None,
     }
 
 
@@ -173,7 +209,8 @@ async def resolve(db: AsyncSession, ref: str, user: Optional[dict] = None) -> di
     """A group by id, or by slug (communities and channels). 404 when neither matches.
 
     A channel comes with its community's slug, name and visibility, and `parent_role`:
-    `user`'s role in the community, which `can_manage` reads.
+    `user`'s role in the community. `org_role` is `user`'s role in the organisation that runs
+    the community. `can_manage` reads both.
     """
     try:
         key, value = "id", str(UUID(ref))
@@ -184,11 +221,13 @@ async def resolve(db: AsyncSession, ref: str, user: Optional[dict] = None) -> di
             text(
                 f"""
                 select g.*, parent.slug as parent_slug, parent.name as parent_name,
-                       parent.visibility as parent_visibility, pm.role as parent_role
+                       parent.visibility as parent_visibility, pm.role as parent_role,
+                       org_team.role as org_role
                   from public.groups g
                   left join public.groups parent on parent.id = g.parent_id
                   left join public.group_members pm
                     on pm.group_id = g.parent_id and pm.user_id = cast(:uid as uuid)
+                  {org_team_join("g", "parent", "cast(:uid as uuid)")}
                  where g.{key} = :v
                 """
             ),
@@ -200,6 +239,7 @@ async def resolve(db: AsyncSession, ref: str, user: Optional[dict] = None) -> di
     g = dict(row)
     g["id"] = str(g["id"])
     g["parent_id"] = str(g["parent_id"]) if g["parent_id"] else None
+    g["organiser_id"] = str(g["organiser_id"]) if g["organiser_id"] else None
     g["category_ids"] = [str(c) for c in g.get("category_ids") or []]
     return g
 
@@ -490,14 +530,19 @@ async def unique_slug(db: AsyncSession, base: str, exclude_id: Optional[str] = N
 
 
 def can_manage(g: dict, role: Optional[str], user: Optional[dict]) -> bool:
-    """`g` comes from `resolve(db, ref, user)`, for a channel's `parent_role`."""
+    """`g` comes from `resolve(db, ref, user)`, for a channel's `parent_role` and the
+    organisation team's `org_role`."""
     if not user:
         return False
     if role == "admin":
         return True
     if g["kind"] == "circle":
         return False
-    return is_orbit_admin(user) or (g["kind"] == "channel" and g.get("parent_role") == "admin")
+    return (
+        is_orbit_admin(user)
+        or g.get("org_role") is not None
+        or (g["kind"] == "channel" and g.get("parent_role") == "admin")
+    )
 
 
 def can_see_card(g: dict, role: Optional[str], user: Optional[dict]) -> bool:
