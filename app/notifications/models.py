@@ -132,7 +132,8 @@ class Notification(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "kind in ('circle_invite','join_request','request_approved','event_shared','announcement')",
+            "kind in ('circle_invite','join_request','request_approved','event_shared',"
+            "'announcement','event_digest')",
             name="notifications_kind_check",
         ),
         Index("notifications_user_idx", "user_id", text("created_at desc"), text("id desc")),

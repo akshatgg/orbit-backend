@@ -1,17 +1,27 @@
-"""Circles & Communities: lookups, access rules and the shapes the API returns.
+"""Circles, Communities & Channels: lookups, access rules and the shapes the API returns.
 
 Who may do what (the router enforces it through these helpers):
 
-| | Circle | Community |
-|---|---|---|
-| see the group card | members (and people it invited) | anyone if public/approval; members if private |
-| see members, events | members | members; public: anyone |
-| read announcements | members | members (and Orbit admins) |
-| manage (edit, invites list, roles, delete) | group admins | group admins and Orbit admins |
-| invite by email / mint a link | any member | group admins and Orbit admins |
-| share an event | any member | members if `allow_member_shares`, else admins |
+| | Circle | Community | Channel |
+|---|---|---|---|
+| see the group card | members (and people it invited) | anyone if public/approval; members if private | as its community, if public/approval; private: members, the invited and managers |
+| see members | members | members; public: anyone | members and managers |
+| see events | members | members; public: anyone | members and managers; public: as its community |
+| read the chat | members | no chat | members (a manager joins first) |
+| post in the chat | members | no chat | members; `post_policy='moderators'`: managers |
+| read announcements | members | members (and Orbit admins) | members (and managers) |
+| manage (edit, invites list, roles, delete) | group admins | group admins and Orbit admins | its admins, its community's admins and Orbit admins |
+| invite by email / mint a link | any member | group admins and Orbit admins | managers |
+| share an event | any member | members if `allow_member_shares`, else admins | as a community, and only managers under `post_policy='moderators'` |
 
 Orbit admins get no special access to Circles: they are private friend groups.
+
+Joining a channel joins its community. Leaving or being removed from a community leaves
+all its channels. An `auto_join` channel can't be left on its own.
+
+`auto_join` must not make everyone reachable: the member list of an `auto_join` group is
+for those who can manage it (everyone else gets the count), and such a group doesn't count
+as sharing a group for direct messages (`app.messaging.service.share_a_group`).
 
 Every list here is a fixed number of set-based queries (no query per row), and
 pages by keyset (`next_cursor`), never OFFSET.
@@ -38,6 +48,7 @@ AVATARS_PER_EVENT = 8
 # An event anyone may open (the events_select rule) over `events e left join organisers o`.
 EVENT_VISIBLE = "(e.organiser_id is null or o.status = 'approved')"
 UPCOMING = "coalesce(e.ends_at, e.starts_at) >= now()"
+LISTED = ("public", "approval")
 
 # Events a community picks up by itself: published, not a duplicate, in one of its
 # categories and (when set) its university. Bound as :categories / :university from the group.
@@ -53,12 +64,15 @@ CARD_SELECT = f"""
 select p.id, p.kind, p.name, p.slug, p.description, p.cover_url, p.university,
        p.visibility, p.category_id, c.name as category_name, c.slug as category_slug,
        p.allow_member_shares, p.created_by, p.created_at, p.my_role,
+       p.parent_id, parent.slug as parent_slug, parent.name as parent_name,
+       p.post_policy, p.is_announcements, p.auto_join,
        mc.n as member_count,
        shared.n + matched.n as upcoming_event_count,
        pr.pending as pending_request,
        cats.ids as cat_ids, cats.slugs as cat_slugs, cats.names as cat_names
   from page p
   left join public.categories c on c.id = p.category_id
+  left join public.groups parent on parent.id = p.parent_id
   cross join lateral (
     select count(*) as n from public.group_members m where m.group_id = p.id
   ) mc
@@ -73,7 +87,7 @@ select p.id, p.kind, p.name, p.slug, p.description, p.cover_url, p.university,
     select count(*) as n
       from public.events e
       left join public.organisers o on o.id = e.organiser_id
-     where p.kind = 'community' and e.category_id = any(p.category_ids)
+     where p.kind <> 'circle' and e.category_id = any(p.category_ids)
        and e.status = 'published' and e.duplicate_of is null
        and (p.university is null or lower(e.university) = lower(p.university))
        and {UPCOMING} and {EVENT_VISIBLE}
@@ -127,6 +141,12 @@ def group_out(row: Any) -> dict[str, Any]:
         "pending_request": bool(r["pending_request"]),
         "created_by": str(r["created_by"]) if r["created_by"] else None,
         "created_at": r["created_at"],
+        "parent_id": str(r["parent_id"]) if r["parent_id"] else None,
+        "parent_slug": r["parent_slug"],
+        "parent_name": r["parent_name"],
+        "post_policy": r["post_policy"],
+        "is_announcements": r["is_announcements"],
+        "auto_join": r["auto_join"],
     }
 
 
@@ -134,6 +154,8 @@ def group_path(g: dict) -> str:
     """Where the frontend shows a group."""
     if g["kind"] == "circle":
         return f"/circles/{g['id']}"
+    if g["kind"] == "channel":
+        return f"/communities/{g['parent_slug']}/{g['slug']}"
     return f"/communities/{g.get('slug') or g['id']}"
 
 
@@ -147,19 +169,37 @@ def as_uuid(value: Any, what: str = "id") -> str:
 # ─── lookups ────────────────────────────────────────────────────────────────
 
 
-async def resolve(db: AsyncSession, ref: str) -> dict:
-    """A group by id, or by slug (communities). 404 when neither matches."""
+async def resolve(db: AsyncSession, ref: str, user: Optional[dict] = None) -> dict:
+    """A group by id, or by slug (communities and channels). 404 when neither matches.
+
+    A channel comes with its community's slug, name and visibility, and `parent_role`:
+    `user`'s role in the community, which `can_manage` reads.
+    """
     try:
         key, value = "id", str(UUID(ref))
     except ValueError:
         key, value = "slug", ref.strip().lower()
     row = (
-        await db.execute(text(f"select * from public.groups where {key} = :v"), {"v": value})
+        await db.execute(
+            text(
+                f"""
+                select g.*, parent.slug as parent_slug, parent.name as parent_name,
+                       parent.visibility as parent_visibility, pm.role as parent_role
+                  from public.groups g
+                  left join public.groups parent on parent.id = g.parent_id
+                  left join public.group_members pm
+                    on pm.group_id = g.parent_id and pm.user_id = cast(:uid as uuid)
+                 where g.{key} = :v
+                """
+            ),
+            {"v": value, "uid": str(user["id"]) if user else None},
+        )
     ).mappings().first()
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Group not found")
     g = dict(row)
     g["id"] = str(g["id"])
+    g["parent_id"] = str(g["parent_id"]) if g["parent_id"] else None
     g["category_ids"] = [str(c) for c in g.get("category_ids") or []]
     return g
 
@@ -227,6 +267,9 @@ async def directory(
         where.append("g.kind = 'community'")
         if not is_orbit_admin(user):
             where.append("(g.visibility in ('public', 'approval') or mr.role is not null)")
+    if mine and not kind:
+        # Channels are listed under their community; this list stays what older clients expect.
+        where.append("g.kind <> 'channel'")
     if category:
         try:
             params["category_id"] = str(UUID(category))
@@ -281,13 +324,98 @@ async def directory(
     more = len(rows) > limit
     rows = rows[:limit]
     items = [group_out(r) for r in rows]
-    previews = await member_previews(db, [i["id"] for i in items])
+    # Nobody sees faces in a group everyone was put in, unless they run it.
+    previews = await member_previews(
+        db,
+        [
+            i["id"]
+            for i in items
+            if not i["auto_join"] or i["my_role"] == "admin" or is_orbit_admin(user)
+        ],
+    )
     for item in items:
         item["members_preview"] = previews.get(item["id"], [])
     next_cursor = None
     if more and items:
         last = items[-1]
         next_cursor = encode_cursor(last["my_role"] is None, last["name"].lower(), last["id"])
+    return {"items": items, "total": int(total), "next_cursor": next_cursor, "page_size": limit}
+
+
+async def channels(
+    db: AsyncSession,
+    parent: dict,
+    user: Optional[dict],
+    *,
+    category: Optional[str],
+    q: Optional[str],
+    limit: int,
+    cursor: Optional[str],
+    manager: bool,
+) -> dict[str, Any]:
+    """The channels of a community I may see: Announcements first, then those I'm in, then by
+    name. Keyset on (not announcements, not joined, lower(name), id). Private ones only for
+    their members and for `manager`. Two queries (page, total)."""
+    where = ["g.parent_id = :parent"]
+    params: dict[str, Any] = {"parent": parent["id"], "uid": str(user["id"]) if user else None}
+    if not manager:
+        where.append("(g.visibility in ('public', 'approval') or mr.role is not null)")
+    if category:
+        try:
+            params["category_id"] = str(UUID(category))
+            where.append("g.category_ids @> array[cast(:category_id as uuid)]")
+        except ValueError:
+            params["category_slug"] = category.strip().lower()
+            where.append(
+                "g.category_ids @> array[(select id from public.categories"
+                " where slug = :category_slug)]"
+            )
+    if q and q.strip():
+        where.append(
+            "(g.name ilike :q escape '\\' or coalesce(g.description, '') ilike :q escape '\\')"
+        )
+        params["q"] = f"%{escape_like(q.strip())}%"
+    base_from = f"""
+        from public.groups g
+        left join public.group_members mr on mr.group_id = g.id and mr.user_id = cast(:uid as uuid)
+       where {" and ".join(where)}
+    """
+    total = (await db.execute(text("select count(*) " + base_from), params)).scalar() or 0
+
+    page_where = ""
+    after = decode_cursor(cursor, "bbsu")
+    if after:
+        page_where = (
+            " and ((not g.is_announcements), (mr.role is null), lower(g.name), g.id)"
+            " > (cast(:c_other as boolean), cast(:c_unjoined as boolean),"
+            " cast(:c_name as text), cast(:c_id as uuid))"
+        )
+        params.update(c_other=after[0], c_unjoined=after[1], c_name=after[2], c_id=after[3])
+    rows = (
+        await db.execute(
+            text(
+                f"""
+                with page as (
+                  select g.*, mr.role as my_role
+                  {base_from}{page_where}
+                   order by (not g.is_announcements), (mr.role is null), lower(g.name), g.id
+                   limit :limit
+                )
+                {CARD_SELECT}
+                order by (not p.is_announcements), (p.my_role is null), lower(p.name), p.id
+                """
+            ),
+            {**params, "limit": limit + 1},
+        )
+    ).mappings().all()
+    more = len(rows) > limit
+    items = [group_out(r) for r in rows[:limit]]
+    next_cursor = None
+    if more and items:
+        last = items[-1]
+        next_cursor = encode_cursor(
+            not last["is_announcements"], last["my_role"] is None, last["name"].lower(), last["id"]
+        )
     return {"items": items, "total": int(total), "next_cursor": next_cursor, "page_size": limit}
 
 
@@ -362,18 +490,48 @@ async def unique_slug(db: AsyncSession, base: str, exclude_id: Optional[str] = N
 
 
 def can_manage(g: dict, role: Optional[str], user: Optional[dict]) -> bool:
+    """`g` comes from `resolve(db, ref, user)`, for a channel's `parent_role`."""
     if not user:
         return False
-    return role == "admin" or (g["kind"] == "community" and is_orbit_admin(user))
+    if role == "admin":
+        return True
+    if g["kind"] == "circle":
+        return False
+    return is_orbit_admin(user) or (g["kind"] == "channel" and g.get("parent_role") == "admin")
+
+
+def can_see_card(g: dict, role: Optional[str], user: Optional[dict]) -> bool:
+    if role or can_manage(g, role, user):
+        return True
+    if g["kind"] == "channel":
+        if g["visibility"] not in LISTED:
+            return False
+        return g["parent_visibility"] in LISTED or g.get("parent_role") is not None
+    return g["kind"] == "community" and g["visibility"] in LISTED
 
 
 def can_read_content(g: dict, role: Optional[str], user: Optional[dict]) -> bool:
-    """Members and the event feed: members; a public community: anyone; Orbit admins: communities."""
+    """The event feed: members; a public community: anyone; Orbit admins: communities; a
+    public channel: whoever may see its card; a channel's managers."""
     if role:
         return True
-    if g["kind"] != "community":
+    if g["kind"] == "circle":
         return False
+    if g["kind"] == "channel":
+        return can_manage(g, role, user) or (g["visibility"] == "public" and can_see_card(g, role, user))
     return g["visibility"] == "public" or is_orbit_admin(user)
+
+
+def can_see_members(g: dict, role: Optional[str], user: Optional[dict]) -> bool:
+    """Who is in it. An `auto_join` group is everyone, not people who chose each other:
+    only those who can manage it see its list; the rest get the count."""
+    if can_manage(g, role, user):
+        return True
+    if g["auto_join"]:
+        return False
+    if g["kind"] == "channel":
+        return role is not None
+    return can_read_content(g, role, user)
 
 
 def can_invite(g: dict, role: Optional[str], user: Optional[dict]) -> bool:
@@ -387,6 +545,8 @@ def can_share(g: dict, role: Optional[str], user: Optional[dict]) -> bool:
         return role is not None
     if can_manage(g, role, user):
         return True
+    if g["kind"] == "channel" and g["post_policy"] == "moderators":
+        return False
     return role is not None and bool(g["allow_member_shares"])
 
 
@@ -394,6 +554,13 @@ def deny(user: Optional[dict], message: str) -> HTTPException:
     if not user:
         return HTTPException(status.HTTP_401_UNAUTHORIZED, "Sign in to continue")
     return HTTPException(status.HTTP_403_FORBIDDEN, message)
+
+
+def deny_read(g: dict, role: Optional[str], user: Optional[dict], message: str) -> HTTPException:
+    """`deny`, except a channel I can't see isn't there at all, so its existence isn't confirmed."""
+    if g["kind"] == "channel" and not can_see_card(g, role, user):
+        return HTTPException(status.HTTP_404_NOT_FOUND, "Group not found")
+    return deny(user, message)
 
 
 async def admin_count(db: AsyncSession, group_id: str) -> int:
@@ -411,19 +578,48 @@ async def admin_count(db: AsyncSession, group_id: str) -> int:
     )
 
 
-async def drop_membership_traces(db: AsyncSession, group_id: str, user_id: str) -> None:
-    """After someone leaves or is removed: their interest marks and chat read state go too."""
+async def remove_membership(db: AsyncSession, group_id: str, user_id: str) -> None:
+    """Someone leaves or is removed: from the group and, for a community, from all its
+    channels. Their interest marks and chat read state go too. A fixed three statements."""
     params = {"g": group_id, "u": user_id}
     await db.execute(
-        text("delete from public.group_event_interests where group_id = :g and user_id = :u"),
+        text(
+            "delete from public.group_members where user_id = :u and group_id in"
+            " (select id from public.groups where id = :g or parent_id = :g)"
+        ),
+        params,
+    )
+    await db.execute(
+        text(
+            "delete from public.group_event_interests where user_id = :u and group_id in"
+            " (select id from public.groups where id = :g or parent_id = :g)"
+        ),
         params,
     )
     await db.execute(
         text(
             "delete from public.conversation_members cm using public.conversations c"
-            " where c.id = cm.conversation_id and c.group_id = :g and cm.user_id = :u"
+            " where c.id = cm.conversation_id and cm.user_id = :u and c.group_id in"
+            " (select id from public.groups where id = :g or parent_id = :g)"
         ),
         params,
+    )
+
+
+async def join_auto_groups(db: AsyncSession, user_id: Any) -> None:
+    """A new account joins every `auto_join` community and those communities' `auto_join` channels."""
+    await db.execute(
+        text(
+            """
+            insert into public.group_members (group_id, user_id, role)
+            select g.id, :u, 'member'
+              from public.groups g
+              left join public.groups parent on parent.id = g.parent_id
+             where g.auto_join and (g.kind = 'community' or parent.auto_join)
+            on conflict do nothing
+            """
+        ),
+        {"u": str(user_id)},
     )
 
 
@@ -450,6 +646,38 @@ async def members(db: AsyncSession, group_id: str, limit: int = 500) -> list[dic
         {"user": user_brief(r, "u_"), "role": r["role"], "joined_at": r["created_at"]}
         for r in rows
     ]
+
+
+async def member(db: AsyncSession, group_id: str, user_id: str) -> Optional[dict[str, Any]]:
+    """One member, in the same shape as `members`."""
+    row = (
+        await db.execute(
+            text(
+                f"""
+                select m.role, m.created_at, {user_columns("m.user_id", "p", "u_")}
+                  from public.group_members m
+                  left join public.profiles p on p.id = m.user_id
+                 where m.group_id = :g and m.user_id = :u
+                """
+            ),
+            {"g": group_id, "u": user_id},
+        )
+    ).mappings().first()
+    if not row:
+        return None
+    return {"user": user_brief(row, "u_"), "role": row["role"], "joined_at": row["created_at"]}
+
+
+async def member_total(db: AsyncSession, group_id: str) -> int:
+    return int(
+        (
+            await db.execute(
+                text("select count(*) from public.group_members where group_id = :g"),
+                {"g": group_id},
+            )
+        ).scalar()
+        or 0
+    )
 
 
 async def member_previews(db: AsyncSession, group_ids: list[str], per_group: int = 5) -> dict[str, list]:
@@ -505,7 +733,7 @@ def _feed_branches(g: dict, when: str, keyset: str, *, limited: bool = True) -> 
             and {timing}{keyset}
           {page})
     """
-    if not (g["kind"] == "community" and g.get("category_ids") and when == "upcoming"):
+    if not (g["kind"] != "circle" and g.get("category_ids") and when == "upcoming"):
         return shared
     matched = f"""
         (select m.id, null::uuid, null::text, null::timestamptz, m.starts_at, m.id
@@ -664,7 +892,7 @@ async def in_feed(db: AsyncSession, g: dict, event_id: str) -> bool:
     ).first()
     if shared:
         return True
-    if g["kind"] != "community" or not g.get("category_ids"):
+    if g["kind"] == "circle" or not g.get("category_ids"):
         return False
     return (
         await db.execute(

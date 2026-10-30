@@ -5,7 +5,7 @@ admins) inside their own transaction, so a change that rolls back leaves no
 notification behind. Only invites go further than the bell: `deliver=True`
 queues a push and an email for after the commit, each following the person's
 notification preferences. Everything else (join requests, approvals, shared
-events, announcements) is in-app only — no email spam.
+events, announcements, the daily event digest) is in-app only — no email spam.
 """
 
 import logging
@@ -30,7 +30,9 @@ from app.users.brief import user_brief, user_columns
 
 logger = logging.getLogger(__name__)
 
-Kind = Literal["circle_invite", "join_request", "request_approved", "event_shared", "announcement"]
+Kind = Literal[
+    "circle_invite", "join_request", "request_approved", "event_shared", "announcement", "event_digest"
+]
 
 INSERT = """
 insert into public.notifications
@@ -98,25 +100,32 @@ async def notify_group(
     actor_id: Any = None,
     invite_id: Any = None,
     announcement_id: Any = None,
+    parent_id: Any = None,
 ) -> None:
-    """In-app only: every member (or every admin) of a group except the actor."""
+    """In-app only: every member (or every admin) of a group except the actor. One INSERT ...
+    SELECT however big the group is.
+
+    With `admins_only`, `parent_id` (a channel's community) adds that group's admins, who
+    moderate the channel too; someone who is both hears once.
+    """
     role = " and m.role = 'admin'" if admins_only else ""
     await db.execute(
         text(
             f"""
             insert into public.notifications
               (user_id, kind, title, body, link, actor_id, group_id, invite_id, announcement_id)
-            select m.user_id, :kind, :title, :body, :link,
+            select distinct m.user_id, :kind, :title, :body, :link,
                    cast(:actor as uuid), cast(:group_id as uuid), cast(:invite_id as uuid),
                    cast(:announcement_id as uuid)
               from public.group_members m
-             where m.group_id = cast(:group_id as uuid){role}
+             where m.group_id in (cast(:group_id as uuid), cast(:parent_id as uuid)){role}
                and m.user_id is distinct from cast(:actor as uuid)
             """
         ),
         {
             **_params(kind, title, body, link, actor_id, group_id, invite_id),
             "announcement_id": str(announcement_id) if announcement_id else None,
+            "parent_id": str(parent_id) if parent_id and admins_only else None,
         },
     )
 

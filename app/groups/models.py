@@ -1,12 +1,19 @@
-"""Circles and Communities.
+"""Circles, Communities and Channels.
 
-One table pair serves both features because they differ only in policy:
+One table pair serves all three because they differ only in policy:
 
 * **Circle** — `kind='circle'`, always `visibility='private'`. You invite people
   you already know; nobody can find it by browsing.
 * **Community** — `kind='community'`, `visibility` is 'public' (join instantly)
   or 'approval' (an admin admits you). Admins create them; the directory lists
   them.
+* **Channel** — `kind='channel'`, a group inside a community (`parent_id`).
+  'public' (one tap), 'approval' or 'private' (hidden, by invitation). It holds a
+  chat; `post_policy` says who may post in it.
+
+`auto_join` puts everyone in a community or channel without anyone choosing it, so
+it never counts as knowing someone: it doesn't allow direct messages, and its member
+list is for those who manage it (see app/groups/service.py).
 
 Sharing an event is a row in `group_events` keyed by (group, event), so the same
 event cannot be posted twice to one group — the PDF's "should not need to be
@@ -61,6 +68,20 @@ class Group(Base):
     allow_member_shares: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("true")
     )
+    # Channels only: the community it sits in. A community with channels can't be deleted.
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("groups.id", ondelete="RESTRICT")
+    )
+    # Channels only: who may post, 'everyone' or 'moderators' (those who can manage it).
+    post_policy: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'everyone'")
+    )
+    is_announcements: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    auto_join: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    # Channels only: the daily auto-post has looked at events created up to this moment.
+    last_autopost_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("users.id", ondelete="SET NULL")
     )
@@ -72,7 +93,7 @@ class Group(Base):
     )
 
     __table_args__ = (
-        CheckConstraint("kind in ('circle','community')", name="groups_kind_check"),
+        CheckConstraint("kind in ('circle','community','channel')", name="groups_kind_check"),
         CheckConstraint(
             "visibility in ('private','public','approval')", name="groups_visibility_check"
         ),
@@ -80,7 +101,13 @@ class Group(Base):
             "char_length(name) between 2 and 60", name="groups_name_check"
         ),
         CheckConstraint(
-            "(kind = 'community') or visibility = 'private'", name="groups_circle_is_private"
+            "kind <> 'circle' or visibility = 'private'", name="groups_circle_is_private"
+        ),
+        CheckConstraint(
+            "(kind = 'channel') = (parent_id is not null)", name="groups_channel_parent_check"
+        ),
+        CheckConstraint(
+            "post_policy in ('everyone','moderators')", name="groups_post_policy_check"
         ),
         CheckConstraint(
             "slug is null or slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'", name="groups_slug_check"
@@ -89,6 +116,13 @@ class Group(Base):
         Index("groups_category_idx", "category_id"),
         Index("groups_kind_category_idx", "kind", "category_id"),
         Index("groups_category_ids_idx", "category_ids", postgresql_using="gin"),
+        Index("groups_parent_idx", "parent_id", postgresql_where=text("parent_id is not null")),
+        Index(
+            "groups_one_announcements_idx",
+            "parent_id",
+            unique=True,
+            postgresql_where=text("is_announcements"),
+        ),
     )
 
 

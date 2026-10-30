@@ -1,12 +1,14 @@
-"""Circles (friends coordinating) and Communities (interest-based).
+"""Circles (friends coordinating), Communities (interest-based) and Channels.
 
-One resource serves both: `kind` decides the rules (see app/groups/service.py
+One resource serves all three: `kind` decides the rules (see app/groups/service.py
 for the access table). A Circle is private and invitation-driven; a Community
 is listed in the directory and is either open (join instantly) or
-approval-based. Communities are created by Orbit admins; any signed-in user can
-create a Circle.
+approval-based; a Channel is a group inside a community, public, approval or
+private, with its own chat. Communities are created by Orbit admins; any
+signed-in user can create a Circle; channels are created by a community's
+moderators and Orbit admins.
 
-`{group_id}` accepts a group's id or, for communities, its slug.
+`{group_id}` accepts a group's id or, for communities and channels, its slug.
 """
 
 from typing import Any, Optional
@@ -24,6 +26,7 @@ from app.groups import service as gs
 from app.groups.schemas import (
     AnnouncementCreate,
     AnnouncementUpdate,
+    ChannelCreate,
     GroupCreate,
     GroupUpdate,
     InterestBody,
@@ -32,6 +35,7 @@ from app.groups.schemas import (
     MemberRole,
     ShareEvent,
 )
+from app.messaging import service as ms
 from app.notifications import inbox
 from app.notifications.messages import group_invite_message
 from app.users.brief import user_brief, user_columns
@@ -39,7 +43,11 @@ from app.users.brief import user_brief, user_columns
 router = APIRouter(prefix="/groups", tags=["groups"], route_class=NumbersRoute)
 
 INVITES_PER_HOUR = 30
-LINK_PATHS = {"circle": "/join/circle/{code}", "community": "/join/community/{code}"}
+LINK_PATHS = {
+    "circle": "/join/circle/{code}",
+    "community": "/join/community/{code}",
+    "channel": "/join/channel/{code}",
+}
 
 
 def _display_name(user: dict) -> str:
@@ -47,8 +55,8 @@ def _display_name(user: dict) -> str:
 
 
 def _admin_title(g: dict) -> tuple[str, str]:
-    """What a group admin is called, bare and with its article: a community's
-    moderator, a circle's admin."""
+    """What a group admin is called, bare and with its article: a community's or
+    channel's moderator, a circle's admin."""
     if g["kind"] == "circle":
         return "admin", "an admin"
     return "moderator", "a moderator"
@@ -183,9 +191,11 @@ async def my_invites(
                 select i.id, i.created_at, i.expires_at,
                        g.id as group_id, g.name as group_name, g.kind as group_kind,
                        g.slug as group_slug, g.cover_url as group_cover_url,
+                       parent.slug as parent_slug, parent.name as parent_name,
                        {user_columns("i.invited_by", "p", "by_")}
                   from public.group_invites i
                   join public.groups g on g.id = i.group_id
+                  left join public.groups parent on parent.id = g.parent_id
                   left join public.profiles p on p.id = i.invited_by
                  where i.invited_user_id = :u and i.kind = 'invite'
                    and i.status = 'pending' and i.expires_at > now()
@@ -206,6 +216,8 @@ async def my_invites(
                     "kind": r["group_kind"],
                     "slug": r["group_slug"],
                     "cover_url": r["group_cover_url"],
+                    "parent_slug": r["parent_slug"],
+                    "parent_name": r["parent_name"],
                 },
                 "invited_by": user_brief(r, "by_"),
                 "created_at": r["created_at"],
@@ -222,13 +234,19 @@ async def shareable_groups(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """The circles and communities I can share an event to, each with `already_shared`."""
+    """The circles, communities and channels I can share an event to, each with `already_shared`.
+
+    Channels come with their community's name, and only when I may post in them. Announcements
+    and communities that hold channels aren't listed: events go to a channel there.
+    """
     eid = gs.as_uuid(event_id, "event id") if event_id else None
     rows = (
         await db.execute(
             text(
                 """
                 select g.id, g.kind, g.name, g.slug, g.cover_url, m.role as my_role,
+                       g.parent_id, parent.slug as parent_slug, parent.name as parent_name,
+                       g.post_policy,
                        (select count(*) from public.group_members mc where mc.group_id = g.id)
                          as member_count,
                        exists (select 1 from public.group_events ge
@@ -236,9 +254,15 @@ async def shareable_groups(
                          as already_shared
                   from public.groups g
                   left join public.group_members m on m.group_id = g.id and m.user_id = :u
-                 where (m.role is not null
-                        and (g.kind = 'circle' or g.allow_member_shares or m.role = 'admin'))
-                    or (g.kind = 'community' and :orbit_admin)
+                  left join public.groups parent on parent.id = g.parent_id
+                  left join public.group_members pm on pm.group_id = g.parent_id and pm.user_id = :u
+                 where not g.is_announcements
+                   and not exists (select 1 from public.groups ch where ch.parent_id = g.id)
+                   and ((m.role is not null
+                         and (g.kind = 'circle' or m.role = 'admin'
+                              or (g.allow_member_shares and g.post_policy = 'everyone')))
+                        or (g.kind <> 'circle' and :orbit_admin)
+                        or pm.role = 'admin')
                  order by (g.kind = 'circle') desc, lower(g.name), g.id
                 """
             ),
@@ -254,6 +278,10 @@ async def shareable_groups(
                 "slug": r["slug"],
                 "cover_url": r["cover_url"],
                 "my_role": r["my_role"],
+                "parent_id": str(r["parent_id"]) if r["parent_id"] else None,
+                "parent_slug": r["parent_slug"],
+                "parent_name": r["parent_name"],
+                "post_policy": r["post_policy"],
                 "member_count": int(r["member_count"]),
                 "already_shared": bool(r["already_shared"]),
             }
@@ -274,7 +302,8 @@ async def preview_invite(
             text(
                 f"""
                 select g.id, g.kind, g.name, g.slug, g.description, g.cover_url, g.visibility,
-                       i.code, i.expires_at,
+                       i.code, i.expires_at, g.parent_id,
+                       parent.slug as parent_slug, parent.name as parent_name,
                        (select count(*) from public.group_members m where m.group_id = g.id)
                          as member_count,
                        exists (select 1 from public.group_members m
@@ -283,6 +312,7 @@ async def preview_invite(
                        {user_columns("i.invited_by", "p", "by_")}
                   from public.group_invites i
                   join public.groups g on g.id = i.group_id
+                  left join public.groups parent on parent.id = g.parent_id
                   left join public.profiles p on p.id = i.invited_by
                  where i.code = :c and i.kind = 'link'
                    and i.status = 'pending' and i.expires_at > now()
@@ -305,6 +335,9 @@ async def preview_invite(
             "cover_url": row["cover_url"],
             "visibility": row["visibility"],
             "member_count": int(row["member_count"]),
+            "parent_id": str(row["parent_id"]) if row["parent_id"] else None,
+            "parent_slug": row["parent_slug"],
+            "parent_name": row["parent_name"],
         },
         "invited_by": user_brief(row, "by_"),
         "already_member": bool(row["already_member"]),
@@ -317,12 +350,17 @@ async def accept_invite_link(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Join a group from its shareable link. The link stays valid for others until it expires."""
+    """Join a group from its shareable link. The link stays valid for others until it expires.
+
+    A channel's link joins its community too.
+    """
     invite = (
         await db.execute(
             text(
-                "select i.group_id, g.kind, g.slug from public.group_invites i"
+                "select i.group_id, g.kind, g.slug, parent.slug as parent_slug"
+                " from public.group_invites i"
                 " join public.groups g on g.id = i.group_id"
+                " left join public.groups parent on parent.id = g.parent_id"
                 " where i.code = :c and i.kind = 'link'"
                 " and i.status = 'pending' and i.expires_at > now()"
             ),
@@ -333,7 +371,13 @@ async def accept_invite_link(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "That invite has expired")
     group_id = str(invite["group_id"])
     await _make_member(db, group_id, str(user["id"]))
-    return {"group_id": group_id, "kind": invite["kind"], "slug": invite["slug"], "status": "joined"}
+    return {
+        "group_id": group_id,
+        "kind": invite["kind"],
+        "slug": invite["slug"],
+        "parent_slug": invite["parent_slug"],
+        "status": "joined",
+    }
 
 
 async def _make_member(
@@ -343,7 +387,15 @@ async def _make_member(
 
     A live admin (moderator) invite settled here still makes them an admin, and
     `role='admin'` raises someone who is already a member; nothing here demotes.
+
+    Joining a channel joins its community first; joining a community joins its `auto_join`
+    channels.
     """
+    parent_id = (
+        await db.execute(text("select parent_id from public.groups where id = :g"), {"g": group_id})
+    ).scalar_one_or_none()
+    if parent_id:
+        await _make_member(db, str(parent_id), user_id)
     settled = (
         await db.execute(
             text(
@@ -364,6 +416,15 @@ async def _make_member(
         ),
         {"g": group_id, "u": user_id, "r": role},
     )
+    if not parent_id:
+        await db.execute(
+            text(
+                "insert into public.group_members (group_id, user_id, role)"
+                " select g.id, :u, 'member' from public.groups g"
+                " where g.parent_id = :g and g.auto_join on conflict do nothing"
+            ),
+            {"g": group_id, "u": user_id},
+        )
     for r in settled:
         await inbox.mark_invite_read(db, r["id"])
 
@@ -374,8 +435,12 @@ async def get_group(
     user: Optional[dict] = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """A group card with `my_role`, `pending_request`, `pending_invite` and (when visible) its members."""
-    g = await gs.resolve(db, group_id)
+    """A group card with `my_role`, `pending_request`, `pending_invite` and (when visible) its members.
+
+    `members_hidden` says the list is held back while `member_count` still counts them. A private
+    channel I can't see is a 404, not a 403, so its existence isn't confirmed.
+    """
+    g = await gs.resolve(db, group_id, user)
     role = await gs.role_of(db, g["id"], user)
     pending_invite = None
     if user and not role:
@@ -389,8 +454,9 @@ async def get_group(
                 {"g": g["id"], "u": str(user["id"])},
             )
         ).scalar_one_or_none()
-    listed = g["kind"] == "community" and g["visibility"] in ("public", "approval")
-    if not (role or listed or pending_invite or (g["kind"] == "community" and gs.is_orbit_admin(user))):
+    if not (pending_invite or gs.can_see_card(g, role, user)):
+        if g["kind"] == "channel":
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Group not found")
         raise gs.deny(user, "This group is private")
 
     out = await gs.card(db, g["id"], user)
@@ -398,8 +464,102 @@ async def get_group(
     out["can_manage"] = gs.can_manage(g, role, user)
     out["can_invite"] = gs.can_invite(g, role, user)
     out["can_share"] = gs.can_share(g, role, user)
-    out["members"] = await gs.members(db, g["id"], 100) if gs.can_read_content(g, role, user) else []
+    # A manager who hasn't joined a channel can't read it, and joins first: this says what it allows.
+    out["can_post"] = bool(role) and (g["post_policy"] == "everyone" or gs.can_manage(g, role, user))
+    out["can_leave"] = bool(role) and not (g["kind"] == "channel" and g["auto_join"])
+    visible = gs.can_see_members(g, role, user)
+    out["members_hidden"] = not visible and g["auto_join"]
+    out["members"] = await gs.members(db, g["id"], 100) if visible else []
     return out
+
+
+# ─── channels ───────────────────────────────────────────────────────────────
+
+
+async def _community(db: AsyncSession, ref: str, user: Optional[dict]) -> tuple[dict, Optional[str]]:
+    g = await gs.resolve(db, ref, user)
+    if g["kind"] != "community":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Only communities have channels")
+    return g, await gs.role_of(db, g["id"], user)
+
+
+@router.get("/{group_id}/channels")
+async def list_channels(
+    group_id: str,
+    q: Optional[str] = Query(None, max_length=100),
+    category: Optional[str] = Query(None, max_length=100),
+    limit: int = Query(24, ge=1, le=CURSOR_LIMIT_MAX),
+    cursor: Optional[str] = Query(None, max_length=500),
+    user: Optional[dict] = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """The channels of a community I may see, Announcements first, then those I'm in.
+
+    Each is a group card with `unread_count` (0 unless joined), `last_message_at` and
+    `last_message_preview` (null unless joined). Pages by keyset: pass `next_cursor` back as
+    `cursor`. A fixed number of queries.
+    """
+    g, role = await _community(db, group_id, user)
+    if not gs.can_see_card(g, role, user):
+        raise gs.deny(user, "This group is private")
+    page = await gs.channels(
+        db,
+        g,
+        user,
+        category=category,
+        q=q,
+        limit=limit,
+        cursor=cursor,
+        manager=gs.can_manage(g, role, user),
+    )
+    activity = await ms.channel_activity(
+        db, str(user["id"]) if user else None, [i["id"] for i in page["items"]]
+    )
+    for item in page["items"]:
+        item.update(activity.get(item["id"], ms.NO_ACTIVITY))
+    return page
+
+
+@router.post("/{group_id}/channels", status_code=201)
+async def create_channel(
+    group_id: str,
+    body: ChannelCreate,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Create a channel. The community's moderators and Orbit admins. The creator becomes its
+    admin and a member of the community."""
+    g, role = await _community(db, group_id, user)
+    if not gs.can_manage(g, role, user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only moderators can create channels")
+    category_ids = await gs.resolve_categories(db, body.category_slugs or [])
+    channel_id = (
+        await db.execute(
+            text(
+                """
+                insert into public.groups
+                  (kind, parent_id, name, slug, description, visibility, post_policy,
+                   category_id, category_ids, created_by)
+                values ('channel', :parent, :name, :slug, :description, :visibility, :post_policy,
+                        cast(:category_id as uuid), cast(:category_ids as uuid[]), :uid)
+                returning id
+                """
+            ),
+            {
+                "parent": g["id"],
+                "name": body.name.strip(),
+                "slug": await gs.unique_slug(db, gs.slugify(body.name)),
+                "description": body.description,
+                "visibility": body.visibility,
+                "post_policy": body.post_policy,
+                "category_id": category_ids[0] if category_ids else None,
+                "category_ids": category_ids,
+                "uid": str(user["id"]),
+            },
+        )
+    ).scalar_one()
+    await _make_member(db, str(channel_id), str(user["id"]), "admin")
+    return await get_group(str(channel_id), user, db)
 
 
 @router.patch("/{group_id}")
@@ -409,8 +569,10 @@ async def update_group(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Edit a group. Group admins; for a community, Orbit admins too."""
-    g = await gs.resolve(db, group_id)
+    """Edit a group. Group admins; for a community, Orbit admins too; for a channel, its
+    community's moderators and Orbit admins. An Announcements channel's visibility and
+    `post_policy` stay as they are (422)."""
+    g = await gs.resolve(db, group_id, user)
     role = await gs.role_of(db, g["id"], user)
     if not gs.can_manage(g, role, user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Group admins only")
@@ -435,15 +597,26 @@ async def update_group(
         ids = [primary] + [c for c in g["category_ids"] if c != primary] if primary else []
         fields["category_ids"] = ids
         fields["category_id"] = primary
+    if g["is_announcements"] and (
+        sent.get("visibility") not in (None, g["visibility"])
+        or sent.get("post_policy") not in (None, g["post_policy"])
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "Announcements stays open to read and moderators-only"
+        )
     if sent.get("visibility"):
         if g["kind"] == "circle":
             if sent["visibility"] != "private":
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "A Circle is always private")
+        elif g["kind"] == "channel":
+            fields["visibility"] = sent["visibility"]
         else:
             fields["visibility"] = "approval" if sent["visibility"] == "private" else sent["visibility"]
-    if sent.get("allow_member_shares") is not None and g["kind"] == "community":
+    if sent.get("post_policy") and g["kind"] == "channel":
+        fields["post_policy"] = sent["post_policy"]
+    if sent.get("allow_member_shares") is not None and g["kind"] != "circle":
         fields["allow_member_shares"] = sent["allow_member_shares"]
-    if sent.get("slug") and g["kind"] == "community" and sent["slug"] != g["slug"]:
+    if sent.get("slug") and g["kind"] != "circle" and sent["slug"] != g["slug"]:
         if not gs.SLUG_RE.match(sent["slug"]):
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -471,11 +644,24 @@ async def delete_group(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """Delete a group and everything in it. Group admins; for a community, Orbit admins too."""
-    g = await gs.resolve(db, group_id)
+    """Delete a group and everything in it. Group admins; for a community, Orbit admins too.
+
+    409 for a community that still has channels, and for an Announcements channel.
+    """
+    g = await gs.resolve(db, group_id, user)
     role = await gs.role_of(db, g["id"], user)
     if not gs.can_manage(g, role, user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Group admins only")
+    if g["is_announcements"]:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Announcements can't be deleted")
+    has_channels = (
+        await db.execute(
+            text("select 1 from public.groups where parent_id = :id limit 1"), {"id": g["id"]}
+        )
+    ).first()
+    if has_channels:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Delete this community's channels first")
+    await ms.release_group_files(db, g["id"])
     await db.execute(text("delete from public.groups where id = :id"), {"id": g["id"]})
     return Response(status_code=204)
 
@@ -489,11 +675,13 @@ async def join_group(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Join a public community (`joined`), or ask to join an approval one (`requested`).
+    """Join a public community or channel (`joined`), or ask to join an approval one (`requested`).
 
-    Someone holding an invite to the group joins straight away.
+    Someone holding an invite to the group joins straight away. Joining a channel joins its
+    community; when that community takes requests and I'm not in it, 403 until I am. A private
+    channel is a 404 unless I can manage it, which joins straight away.
     """
-    g = await gs.resolve(db, group_id)
+    g = await gs.resolve(db, group_id, user)
     if await gs.role_of(db, g["id"], user):
         return {"status": "joined"}
     invited = (
@@ -510,6 +698,14 @@ async def join_group(
         return {"status": "joined"}
     if g["kind"] == "circle":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Circles are joined by invitation")
+    if g["kind"] == "channel":
+        if gs.can_manage(g, None, user):
+            await _make_member(db, g["id"], str(user["id"]))
+            return {"status": "joined"}
+        if g["visibility"] == "private":
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Group not found")
+        if not g["parent_role"] and g["parent_visibility"] != "public":
+            raise HTTPException(status.HTTP_403_FORBIDDEN, f"Join {g['parent_name']} first")
     if g["visibility"] == "public":
         await _make_member(db, g["id"], str(user["id"]))
         return {"status": "joined"}
@@ -544,6 +740,7 @@ async def join_group(
             link=gs.group_path(g),
             actor_id=str(user["id"]),
             invite_id=request_id,
+            parent_id=g["parent_id"],
         )
     return {"status": "requested"}
 
@@ -566,13 +763,20 @@ async def leave_group(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """Leave a group. The last admin of a group with other members hands over first;
-    the last member of a circle leaving deletes it."""
-    g = await gs.resolve(db, group_id)
+    """Leave a group. The last admin of a circle or community with other members hands over
+    first (a channel needs no admin of its own); the last member of a circle leaving deletes it.
+
+    Leaving a community leaves all its channels. An `auto_join` channel can't be left on its own (409).
+    """
+    g = await gs.resolve(db, group_id, user)
     role = await gs.role_of(db, g["id"], user)
     if not role:
         return Response(status_code=204)
-    if role == "admin" and await gs.admin_count(db, g["id"]) <= 1:
+    if g["kind"] == "channel" and g["auto_join"]:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"Leave {g['parent_name']} to leave this channel"
+        )
+    if g["kind"] != "channel" and role == "admin" and await gs.admin_count(db, g["id"]) <= 1:
         others = (
             await db.execute(
                 text(
@@ -582,17 +786,14 @@ async def leave_group(
             )
         ).scalar() or 0
         if others == 0 and g["kind"] == "circle":
+            await ms.release_group_files(db, g["id"])
             await db.execute(text("delete from public.groups where id = :g"), {"g": g["id"]})
             return Response(status_code=204)
         if others and not (g["kind"] == "community" and gs.is_orbit_admin(user)):
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "Make someone else an admin before you leave"
             )
-    await db.execute(
-        text("delete from public.group_members where group_id = :g and user_id = :u"),
-        {"g": g["id"], "u": str(user["id"])},
-    )
-    await gs.drop_membership_traces(db, g["id"], str(user["id"]))
+    await gs.remove_membership(db, g["id"], str(user["id"]))
     return Response(status_code=204)
 
 
@@ -602,13 +803,22 @@ async def group_members(
     user: Optional[dict] = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Members, admins first: `{user, role, joined_at}`."""
-    g = await gs.resolve(db, group_id)
+    """Members, admins first: `{user, role, joined_at}`, up to 500 (`total` counts them all).
+
+    An `auto_join` group's list is for those who can manage it: others get no items, the
+    count and `hidden: true`.
+    """
+    g = await gs.resolve(db, group_id, user)
     role = await gs.role_of(db, g["id"], user)
-    if not gs.can_read_content(g, role, user):
-        raise gs.deny(user, "Join this group to see its members")
-    items = await gs.members(db, g["id"])
-    return {"items": items, "total": len(items)}
+    if not gs.can_see_members(g, role, user):
+        if g["auto_join"] and gs.can_see_card(g, role, user):
+            return {"items": [], "total": await gs.member_total(db, g["id"]), "hidden": True}
+        raise gs.deny_read(g, role, user, "Join this group to see its members")
+    return {
+        "items": await gs.members(db, g["id"]),
+        "total": await gs.member_total(db, g["id"]),
+        "hidden": False,
+    }
 
 
 async def _target_role(db: AsyncSession, group_id: str, user_id: str) -> str:
@@ -630,18 +840,24 @@ async def remove_member(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """Remove a member. Group admins (communities: Orbit admins too). Never the last admin."""
-    g = await gs.resolve(db, group_id)
+    """Remove a member. Group admins (communities: Orbit admins too; channels: the community's
+    moderators too). Never the last admin of a circle or community (a channel needs none).
+
+    Removing someone from a community removes them from all its channels. From an `auto_join`
+    channel on its own: 409.
+    """
+    g = await gs.resolve(db, group_id, user)
     if not gs.can_manage(g, await gs.role_of(db, g["id"], user), user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Group admins only")
     target = str(user_id)
-    if await _target_role(db, g["id"], target) == "admin" and await gs.admin_count(db, g["id"]) <= 1:
+    target_role = await _target_role(db, g["id"], target)
+    if g["kind"] == "channel" and g["auto_join"]:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"Remove them from {g['parent_name']} instead"
+        )
+    if g["kind"] != "channel" and target_role == "admin" and await gs.admin_count(db, g["id"]) <= 1:
         raise HTTPException(status.HTTP_409_CONFLICT, _last_admin(g))
-    await db.execute(
-        text("delete from public.group_members where group_id = :g and user_id = :u"),
-        {"g": g["id"], "u": target},
-    )
-    await gs.drop_membership_traces(db, g["id"], target)
+    await gs.remove_membership(db, g["id"], target)
     return Response(status_code=204)
 
 
@@ -654,19 +870,23 @@ async def set_member_role(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Make a member an admin (a community moderator) or back to member."""
-    g = await gs.resolve(db, group_id)
+    g = await gs.resolve(db, group_id, user)
     if not gs.can_manage(g, await gs.role_of(db, g["id"], user), user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Group admins only")
     target = str(user_id)
     current = await _target_role(db, g["id"], target)
-    if current == "admin" and body.role == "member" and await gs.admin_count(db, g["id"]) <= 1:
+    if (
+        g["kind"] != "channel"
+        and current == "admin"
+        and body.role == "member"
+        and await gs.admin_count(db, g["id"]) <= 1
+    ):
         raise HTTPException(status.HTTP_409_CONFLICT, _last_admin(g))
     await db.execute(
         text("update public.group_members set role = :r where group_id = :g and user_id = :u"),
         {"r": body.role, "g": g["id"], "u": target},
     )
-    row = next(m for m in await gs.members(db, g["id"]) if m["user"]["id"] == target)
-    return row
+    return await gs.member(db, g["id"], target)
 
 
 # ─── invitations ────────────────────────────────────────────────────────────
@@ -688,7 +908,7 @@ async def create_invite(
     `status: "promoted"`), and a pending invite of theirs is upgraded.
     409 when they're already a member (or already an admin) or already invited.
     """
-    g = await gs.resolve(db, group_id)
+    g = await gs.resolve(db, group_id, user)
     role = await gs.role_of(db, g["id"], user)
     admin_word, an_admin = _admin_title(g)
     if body.role == "admin" and not gs.can_manage(g, role, user):
@@ -750,7 +970,7 @@ async def create_invite(
         ).first()
         if not promoted:
             raise HTTPException(status.HTTP_409_CONFLICT, f"They're already {an_admin}")
-        what = "circle" if g["kind"] == "circle" else "community"
+        what = g["kind"]
         await inbox.notify(
             db,
             [target],
@@ -876,7 +1096,7 @@ async def list_invites(
 
     `role` is what accepting makes them: 'admin' for a moderator invite, else 'member'.
     """
-    g = await gs.resolve(db, group_id)
+    g = await gs.resolve(db, group_id, user)
     if not gs.can_manage(g, await gs.role_of(db, g["id"], user), user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Group admins only")
     rows = (
@@ -929,7 +1149,7 @@ async def respond_invite(
     The requester may withdraw their own request (`accept: false`). 409 when it was
     already answered, 410 when it has expired.
     """
-    g = await gs.resolve(db, group_id)
+    g = await gs.resolve(db, group_id, user)
     invite = (
         await db.execute(
             text(
@@ -999,10 +1219,11 @@ async def invite_link(
 ) -> dict:
     """A shareable join link (reused while it has more than a day left; 14 days from minting).
 
-    `url_path` is the frontend page for it: `/join/circle/{code}` or `/join/community/{code}`.
-    Anyone signed in who opens it joins as a member, even an approval community.
+    `url_path` is the frontend page for it: `/join/circle/{code}`, `/join/community/{code}` or
+    `/join/channel/{code}`. Anyone signed in who opens it joins as a member, even an approval
+    community or a private channel; a channel's link joins its community too.
     """
-    g = await gs.resolve(db, group_id)
+    g = await gs.resolve(db, group_id, user)
     if not gs.can_invite(g, await gs.role_of(db, g["id"], user), user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You can't invite people to this group")
     row = (
@@ -1055,11 +1276,11 @@ async def list_group_events(
     Up to 8 interested/going members per event, with full counts.
     Pages by keyset: pass `next_cursor` back as `cursor`.
     """
-    g = await gs.resolve(db, group_id)
+    g = await gs.resolve(db, group_id, user)
     role = await gs.role_of(db, g["id"], user)
     if not gs.can_read_content(g, role, user):
-        raise gs.deny(user, "Join this group to see its events")
-    show_people = bool(role) or (g["kind"] == "community" and gs.is_orbit_admin(user))
+        raise gs.deny_read(g, role, user, "Join this group to see its events")
+    show_people = (bool(role) or gs.can_manage(g, role, user)) and gs.can_see_members(g, role, user)
     return await gs.feed(
         db, g, user, when=when, limit=limit, cursor=cursor, show_people=show_people
     )
@@ -1072,12 +1293,16 @@ async def share_event(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Share a published, upcoming event with the group. Sharing it twice is a no-op."""
-    g = await gs.resolve(db, group_id)
+    """Share a published, upcoming event with the group. Sharing it twice is a no-op.
+
+    In a channel it also appears in the chat as an event message.
+    """
+    g = await gs.resolve(db, group_id, user)
     role = await gs.role_of(db, g["id"], user)
     if not gs.can_share(g, role, user):
-        if role or (g["kind"] == "community" and gs.is_orbit_admin(user)):
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Only admins can share to this community")
+        if role:
+            where = "channel" if g["kind"] == "channel" else "community"
+            raise HTTPException(status.HTTP_403_FORBIDDEN, f"Only admins can share to this {where}")
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Join this group to share with it")
     event_id = gs.as_uuid(body.event_id, "event id")
     event = (
@@ -1109,6 +1334,8 @@ async def share_event(
             {"g": g["id"], "e": event_id, "u": str(user["id"]), "n": body.note},
         )
     ).first()
+    if inserted and g["kind"] == "channel":
+        await ms.post_shared_event(db, g, event_id, str(user["id"]), body.note)
     if inserted and g["kind"] == "circle":
         await inbox.notify_group(
             db,
@@ -1134,8 +1361,9 @@ async def unshare_event(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """Remove a shared event. Whoever shared it, or a group admin."""
-    g = await gs.resolve(db, group_id)
+    """Remove a shared event. Whoever shared it, or a group admin. In a channel, its chat
+    message goes too, unless the daily auto-post made it."""
+    g = await gs.resolve(db, group_id, user)
     eid = str(event_id)
     row = (
         await db.execute(
@@ -1153,6 +1381,8 @@ async def unshare_event(
         text("delete from public.group_events where group_id = :g and event_id = :e"),
         {"g": g["id"], "e": eid},
     )
+    if g["kind"] == "channel":
+        await ms.retract_shared_event(db, g["id"], eid)
     if not await gs.in_feed(db, g, eid):
         await db.execute(
             text("delete from public.group_event_interests where group_id = :g and event_id = :e"),
@@ -1162,7 +1392,7 @@ async def unshare_event(
 
 
 async def _interest_target(db: AsyncSession, group_id: str, event_id: UUID, user: dict) -> tuple[dict, str]:
-    g = await gs.resolve(db, group_id)
+    g = await gs.resolve(db, group_id, user)
     if not await gs.role_of(db, g["id"], user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Join this group first")
     eid = str(event_id)
@@ -1202,7 +1432,7 @@ async def clear_interest(
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     """Take my name off an event."""
-    g = await gs.resolve(db, group_id)
+    g = await gs.resolve(db, group_id, user)
     await db.execute(
         text(
             "delete from public.group_event_interests"
@@ -1220,10 +1450,14 @@ async def event_interest(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Everyone in the group who marked this event, going first."""
-    g = await gs.resolve(db, group_id)
-    if not await gs.role_of(db, g["id"], user):
+    """Everyone in the group who marked this event, going first. In an `auto_join` group, only
+    for those who can manage it."""
+    g = await gs.resolve(db, group_id, user)
+    role = await gs.role_of(db, g["id"], user)
+    if not role:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Join this group first")
+    if not gs.can_see_members(g, role, user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only moderators can see who marked this")
     rows = (
         await db.execute(
             text(
@@ -1277,11 +1511,12 @@ async def list_announcements(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Group notices, newest first (the latest 50). Members (communities: Orbit admins too)."""
-    g = await gs.resolve(db, group_id)
+    """Group notices, newest first (the latest 50). Members (communities and channels: their
+    managers too)."""
+    g = await gs.resolve(db, group_id, user)
     role = await gs.role_of(db, g["id"], user)
-    if not (role or (g["kind"] == "community" and gs.is_orbit_admin(user))):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Join this group to read its announcements")
+    if not (role or gs.can_manage(g, role, user)):
+        raise gs.deny_read(g, role, user, "Join this group to read its announcements")
     rows = (
         await db.execute(
             text(ANNOUNCEMENT_SELECT + " where a.group_id = :g order by a.created_at desc limit 50"),
@@ -1300,10 +1535,13 @@ async def create_announcement(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Post a notice; every other member gets it in their inbox. Group admins."""
-    g = await gs.resolve(db, group_id)
+    """Post a notice; every other member gets it in their inbox. Group admins. A channel has
+    its chat instead (422); its old notices stay readable and editable."""
+    g = await gs.resolve(db, group_id, user)
     if not gs.can_manage(g, await gs.role_of(db, g["id"], user), user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Group admins only")
+    if g["kind"] == "channel":
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Post in the channel's chat instead")
     event_id = gs.as_uuid(body.event_id, "event id") if body.event_id else None
     announcement_id = (
         await db.execute(
@@ -1340,7 +1578,7 @@ async def _editable_announcement(
 ) -> tuple[dict, str]:
     """The group and announcement if I may change it: 404 if it isn't in this group,
     403 unless I wrote it, I'm a group admin, or (a community) I'm an Orbit admin."""
-    g = await gs.resolve(db, group_id)
+    g = await gs.resolve(db, group_id, user)
     author = (
         await db.execute(
             text(

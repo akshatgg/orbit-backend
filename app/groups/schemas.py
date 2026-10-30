@@ -20,6 +20,15 @@ class GroupCreate(BaseModel):
     allow_member_shares: Optional[bool] = None
 
 
+class ChannelCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=60)
+    description: Optional[str] = Field(default=None, max_length=500)
+    visibility: Literal["public", "approval", "private"] = "public"
+    post_policy: Literal["everyone", "moderators"] = "everyone"
+    # Category ids or slugs, primary first: what the channel's feed and daily auto-post pick up.
+    category_slugs: Optional[list[str]] = Field(default=None, max_length=10)
+
+
 class GroupUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=2, max_length=60)
     description: Optional[str] = Field(default=None, max_length=500)
@@ -31,6 +40,8 @@ class GroupUpdate(BaseModel):
     cover_url: Optional[str] = Field(default=None, max_length=1000)
     slug: Optional[str] = Field(default=None, max_length=60)
     allow_member_shares: Optional[bool] = None
+    # Channels only.
+    post_policy: Optional[Literal["everyone", "moderators"]] = None
 
 
 class MemberRole(BaseModel):
