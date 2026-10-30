@@ -2,11 +2,15 @@
 
 For each channel with categories, the events that match it (`MATCHED`, `EVENT_VISIBLE`,
 upcoming) and were created since its `last_autopost_at`: up to 5 soonest as event messages,
-then one system message "and N more new events" if there are more. A channel that has never
-been looked at starts from now, so nothing floods; the move script sets it for the same reason.
+then one system message "and N more new events" if there are more. The Announcements of a
+community an organisation runs gets that organisation's new events the same way. A channel that
+has never been looked at starts from now, so nothing floods; the move script sets it for the
+same reason. An event already in a chat (shared by hand, or posted before) isn't posted again.
 
 Each Announcements channel then gets one summary: how many new events arrived per category, with
-a link for each (the category's channel, else its search). Nothing new, no summary.
+a link for each (the category's channel, else its search). ORBIT's own counts every new event;
+an organisation's community counts those in its channels' categories and the organisation's
+own. Nothing new, no summary.
 
 Then one bell notification per person per run, however many channels they're in; no email and
 no push. Everything is set-based, in one transaction: a second run finds nothing new, and a
@@ -52,6 +56,7 @@ async def post_new_events(db: AsyncSession) -> dict[str, int]:
                 f"""
                 select ch.id as group_id, x.event_id, x.rn, x.total
                   from public.groups ch
+                  left join public.groups parent on parent.id = ch.parent_id
                   left join public.conversations c on c.group_id = ch.id
                   cross join lateral (
                     select e.id as event_id,
@@ -59,7 +64,8 @@ async def post_new_events(db: AsyncSession) -> dict[str, int]:
                            count(*) over () as total
                       from public.events e
                       left join public.organisers o on o.id = e.organiser_id
-                     where e.category_id = any(ch.category_ids)
+                     where (e.category_id = any(ch.category_ids)
+                            or (ch.is_announcements and e.organiser_id = parent.organiser_id))
                        and e.status = 'published' and e.duplicate_of is null
                        and (ch.university is null or lower(e.university) = lower(ch.university))
                        and {UPCOMING} and {EVENT_VISIBLE}
@@ -70,7 +76,9 @@ async def post_new_events(db: AsyncSession) -> dict[str, int]:
                           where m.conversation_id = c.id and m.event_id = e.id and m.kind = 'event'
                        )
                   ) x
-                 where ch.kind = 'channel' and cardinality(ch.category_ids) > 0
+                 where ch.kind = 'channel'
+                   and (cardinality(ch.category_ids) > 0
+                        or (ch.is_announcements and parent.organiser_id is not null))
                 """
             )
         )
@@ -171,11 +179,12 @@ async def post_new_events(db: AsyncSession) -> dict[str, int]:
             )
         ).scalar() or 0
 
+    # Announcements moves on in `post_summaries`, which reads the same window after this.
     channels = (
         await db.execute(
             text(
                 "update public.groups set last_autopost_at = now()"
-                " where kind = 'channel' and cardinality(category_ids) > 0"
+                " where kind = 'channel' and cardinality(category_ids) > 0 and not is_announcements"
             )
         )
     ).rowcount
@@ -196,7 +205,8 @@ async def post_summaries(db: AsyncSession) -> dict[str, int]:
         await db.execute(
             text(
                 f"""
-                select a.id as group_id, parent.slug as parent_slug, cat.name, cat.slug, count(*) as n,
+                select a.id as group_id, parent.slug as parent_slug, parent.name as parent_name,
+                       parent.organiser_id, cat.name, cat.slug, count(*) as n,
                        (array_agg(e.cover_url order by e.starts_at, e.id)
                           filter (where e.cover_url is not null))[1] as cover_url,
                        (select ch.slug from public.groups ch
@@ -213,7 +223,13 @@ async def post_summaries(db: AsyncSession) -> dict[str, int]:
                    and e.status = 'published' and e.duplicate_of is null
                    and (parent.university is null or lower(e.university) = lower(parent.university))
                    and {UPCOMING} and {EVENT_VISIBLE}
-                 group by a.id, a.parent_id, parent.slug, cat.name, cat.slug, e.category_id
+                   and (parent.organiser_id is null
+                        or e.organiser_id = parent.organiser_id
+                        or exists (select 1 from public.groups ch
+                                    where ch.parent_id = a.parent_id
+                                      and e.category_id = any(ch.category_ids)))
+                 group by a.id, a.parent_id, parent.slug, parent.name, parent.organiser_id,
+                          cat.name, cat.slug, e.category_id
                  order by n desc, cat.name
                 """
             )
@@ -221,7 +237,10 @@ async def post_summaries(db: AsyncSession) -> dict[str, int]:
     ).mappings().all()
 
     by_group: dict[str, list[dict[str, Any]]] = {}
+    # Where the bell says they are: ORBIT, or the organisation's community.
+    where: dict[str, str] = {}
     for r in rows:
+        where[str(r["group_id"])] = f"in {r['parent_name']}" if r["organiser_id"] else "on ORBIT"
         by_group.setdefault(str(r["group_id"]), []).append(
             {
                 "name": r["name"] or "Other",
@@ -292,7 +311,10 @@ async def post_summaries(db: AsyncSession) -> dict[str, int]:
                     select count(*) from sent
                     """
                 ),
-                {"groups": groups, "titles": [f"{_new_events(n)} on ORBIT" for n in totals]},
+                {
+                    "groups": groups,
+                    "titles": [f"{_new_events(n)} {where[g]}" for g, n in zip(groups, totals)],
+                },
             )
         ).scalar() or 0
     await db.execute(text("update public.groups set last_autopost_at = now() where is_announcements"))
