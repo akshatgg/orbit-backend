@@ -20,7 +20,9 @@ from app.messaging.models import (  # noqa: F401
     Conversation,
     ConversationMember,
     Message,
+    MessageAttachment,
     MessageEdit,
+    MessageLink,
     UserBlock,
 )
 from app.notifications.models import (  # noqa: F401

@@ -475,7 +475,7 @@ def group_invite_message(
 ) -> Message:
     """Someone invited you to a Circle or a Community — as a member, or (`role='admin'`)
     to help run it: a community's moderator, a circle's admin."""
-    what = "circle" if group["kind"] == "circle" else "community"
+    what = group["kind"]
     name = group["name"]
     footer = "You're getting this because someone invited you to a group on ORBIT."
     if role == "admin":

@@ -9,8 +9,11 @@ from uuid import UUID
 
 from app.core.config import settings
 
-UPLOAD_KINDS = ("event-covers", "organiser-logos")
+UPLOAD_KINDS = ("event-covers", "organiser-logos", "chat", "chat_doc")
 ALLOWED_FORMATS = "jpg,png,webp"
+CHAT_FOLDER = "orbit/chat"
+CHAT_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+CHAT_DOC_MAX_BYTES = 10 * 1024 * 1024
 
 # Never part of a Cloudinary signature.
 _UNSIGNED = {"file", "api_key", "resource_type", "cloud_name"}
@@ -32,13 +35,18 @@ def sign(kind: str, user_id: UUID | str) -> dict:
     """Signed parameters for a direct browser upload into orbit/<kind>/<user>.
 
     Same shape as the frontend's /api/uploads/sign. The browser posts the file
-    to https://api.cloudinary.com/v1_1/<cloudName>/image/upload with api_key,
+    to https://api.cloudinary.com/v1_1/<cloudName>/<resourceType>/upload with api_key,
     timestamp, signature, folder and allowed_formats exactly as returned here.
+
+    Chat files share orbit/chat/<user>: `chat` is an image, `chat_doc` a PDF, which
+    Cloudinary keeps as a `raw` file.
     """
-    folder = f"orbit/{kind}/{user_id}"
+    folder = f"{CHAT_FOLDER}/{user_id}" if kind in ("chat", "chat_doc") else f"orbit/{kind}/{user_id}"
+    resource_type = "raw" if kind == "chat_doc" else "image"
+    formats = "pdf" if kind == "chat_doc" else ALLOWED_FORMATS
     timestamp = int(time.time())
     signature = sign_params(
-        {"allowed_formats": ALLOWED_FORMATS, "folder": folder, "timestamp": timestamp},
+        {"allowed_formats": formats, "folder": folder, "timestamp": timestamp},
         settings.CLOUDINARY_API_SECRET or "",
     )
     return {
@@ -47,8 +55,13 @@ def sign(kind: str, user_id: UUID | str) -> dict:
         "timestamp": timestamp,
         "signature": signature,
         "folder": folder,
-        "allowedFormats": ALLOWED_FORMATS,
-        "maxBytes": int((settings.IMAGE_MAX_BYTES or {}).get(kind, 5 * 1024 * 1024)),
+        "allowedFormats": formats,
+        "resourceType": resource_type,
+        "maxBytes": int(
+            (settings.IMAGE_MAX_BYTES or {}).get(
+                kind, CHAT_DOC_MAX_BYTES if kind == "chat_doc" else CHAT_IMAGE_MAX_BYTES
+            )
+        ),
     }
 
 
@@ -62,6 +75,13 @@ def orbit_image_public_id(url: Optional[str], cloud_name: str) -> Optional[str]:
     ("orbit/event-covers/…"), or None for anything else (another account,
     another folder, Supabase Storage, Meetup/Luma images). Only these ids are
     ever deleted."""
+    asset = orbit_asset(url, cloud_name)
+    return asset[1] if asset and asset[0] == "image" else None
+
+
+def orbit_asset(url: Optional[str], cloud_name: str) -> Optional[tuple[str, str]]:
+    """(resource type, public id) of an image or raw file in Orbit's own folders, else
+    None. A raw file's public id keeps its extension; an image's doesn't."""
     if not url:
         return None
     try:
@@ -71,9 +91,12 @@ def orbit_image_public_id(url: Optional[str], cloud_name: str) -> Optional[str]:
         path = unquote(parsed.path)
     except ValueError:
         return None
-    prefix = f"/{cloud_name}/image/upload/"
-    if not path.startswith(prefix):
+    resource_type = next(
+        (t for t in ("image", "raw") if path.startswith(f"/{cloud_name}/{t}/upload/")), None
+    )
+    if resource_type is None:
         return None
+    prefix = f"/{cloud_name}/{resource_type}/upload/"
     # Drop transformation segments ("f_auto,q_auto,…") and the version ("v1792…").
     parts = path[len(prefix):].split("/")
     while len(parts) > 1 and (
@@ -82,5 +105,9 @@ def orbit_image_public_id(url: Optional[str], cloud_name: str) -> Optional[str]:
         or "," in parts[0]
     ):
         parts.pop(0)
-    public_id = _EXTENSION.sub("", "/".join(parts))
-    return public_id if public_id.startswith("orbit/") and ".." not in public_id else None
+    public_id = "/".join(parts)
+    if resource_type == "image":
+        public_id = _EXTENSION.sub("", public_id)
+    if not public_id.startswith("orbit/") or ".." in public_id:
+        return None
+    return resource_type, public_id

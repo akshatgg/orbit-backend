@@ -55,20 +55,22 @@ app/
   tickets/             ticket types, questions, registrations (models)
   payments/            Stripe checkout, Connect, webhook
   notifications/       preferences, push subscriptions, web push + email delivery, in-app inbox
-  groups/              Circles and Communities
-  messaging/           circle chat, direct messages, blocks
+  groups/              Circles, Communities and their Channels
+  messaging/           circle and channel chat, direct messages, blocks, attachments, links
   admin/               overview, events, users, organisers, categories, CSV
   sources/             feeds, sync engine, review queue, duplicates
-  cron/                nightly refresh + daily reminders
+  cron/                nightly refresh + daily reminders + the channels' daily auto-post
   uploads/             Cloudinary upload signature, image release
   public/              landing, sitemap data, OG data
   connectors/          feed readers (iCal implemented; platform ones pending)
 alembic/versions/0001_baseline.py   the whole schema in one revision
 alembic/versions/0002_*.py          invite kinds, inbox, messaging (hand-written)
 alembic/versions/0003_*.py          communities link to several categories
+alembic/versions/0006_*.py          channels, chat attachments and links
 alembic/sql/orbit_functions.sql     generated from Orbit's Supabase migrations
 scripts/               extract_sql.py, dump_schema.sh, schema_diff.py,
-                       seed_communities.py (the launch communities; idempotent)
+                       seed_communities.py (the launch communities; idempotent),
+                       move_to_community.py (makes them channels of ORBIT; never automatic)
 ```
 
 ## Database

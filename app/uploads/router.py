@@ -1,4 +1,4 @@
-"""Upload routes. Images go straight from the browser to Cloudinary."""
+"""Upload routes. Files go straight from the browser to Cloudinary."""
 
 from typing import Literal
 
@@ -13,7 +13,7 @@ router = APIRouter(prefix="/uploads", tags=["uploads"])
 
 
 class SignIn(BaseModel):
-    kind: Literal["event-covers", "organiser-logos"]
+    kind: Literal["event-covers", "organiser-logos", "chat", "chat_doc"]
 
 
 @router.post("/sign")

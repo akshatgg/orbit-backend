@@ -1,11 +1,15 @@
-"""Circle chat and direct messages (polling, no websockets).
+"""Circle and channel chat, and direct messages (polling, no websockets).
 
 The open thread polls `GET /messages/conversations/{id}?after=<created_at of the
 newest message>&changed_since=<polled_at of the last response>` (new messages in
 `items`, edits and deletes of older ones in `changed`); the nav badge polls
 `GET /messages/unread-count`. Messages never go to the notifications inbox; a
 direct message sends a web push only when the recipient has no unread push from
-that conversation in the last 10 minutes.
+that conversation in the last 10 minutes. A post in an Announcements channel is
+the one exception: it reaches its members' bell, as a community announcement does.
+
+The conversation list and the badge are circles and direct messages only; a channel's
+unread count is on `GET /groups/{community}/channels`.
 """
 
 from datetime import datetime
@@ -21,7 +25,7 @@ from app.core.deps import require_user
 from app.core.pagination import CURSOR_LIMIT_MAX
 from app.groups import service as gs
 from app.messaging import service as ms
-from app.messaging.schemas import BlockCreate, DirectStart, MessageCreate
+from app.messaging.schemas import BlockCreate, DirectStart, MessageCreate, MessageUpdate
 from app.users.brief import user_brief, user_columns
 
 router = APIRouter(prefix="/messages", tags=["messages"])
@@ -59,7 +63,8 @@ async def start_direct(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Get or create my direct conversation with someone I share a circle or community with.
+    """Get or create my direct conversation with someone I share a circle, community or channel
+    with. An `auto_join` group doesn't count.
 
     403 when we share no group, or either of us blocked the other.
     """
@@ -96,31 +101,20 @@ async def start_direct(
 
 
 @group_chat_router.get("/{group_id}/conversation")
-async def circle_conversation(
+async def group_conversation(
     group_id: str,
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """The circle's chat (created on first use). Members only; communities have no chat."""
-    g = await gs.resolve(db, group_id)
-    if g["kind"] != "circle":
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Only circles have a chat")
-    if not await gs.role_of(db, g["id"], user):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "You're not in this circle")
-    conversation_id = (
-        await db.execute(
-            text(
-                """
-                insert into public.conversations (kind, group_id, created_by)
-                values ('circle', :g, :u)
-                on conflict (group_id) do update set kind = excluded.kind
-                returning id
-                """
-            ),
-            {"g": g["id"], "u": str(user["id"])},
-        )
-    ).scalar_one()
-    return {"id": str(conversation_id)}
+    """The chat of a circle or channel (created on first use). Members only; communities have
+    no chat. A private channel I can't see is a 404."""
+    g = await gs.resolve(db, group_id, user)
+    if g["kind"] == "community":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Only circles and channels have a chat")
+    role = await gs.role_of(db, g["id"], user)
+    if not role:
+        raise gs.deny_read(g, role, user, f"You're not in this {g['kind']}")
+    return {"id": await ms.group_conversation(db, g, str(user["id"]))}
 
 
 @router.get("/conversations/{conversation_id}")
@@ -137,8 +131,9 @@ async def get_thread(
 ) -> dict:
     """Messages oldest -> newest: the newest page, the page `before` a point, or everything `after` one.
 
-    With `after` (the polling path) `conversation` is the slim `{id, kind, group, other_user}`;
-    otherwise it is the full list item plus `members`. `has_more` says whether more
+    With `after` (the polling path) `conversation` is the slim `{id, kind, group, other_user,
+    can_post, can_moderate}`; otherwise it is the full list item plus those two and `members`
+    (empty in an `auto_join` channel unless I can manage it). `has_more` says whether more
     messages lie beyond the page (older ones, or with `after` newer ones).
 
     Edits and deletes: pass the previous response's `polled_at` as `changed_since` and
@@ -163,6 +158,7 @@ async def get_thread(
             db, str(user["id"]), limit=1, cursor=None, only=str(conversation_id)
         )
         conversation = listed["items"][0] if listed["items"] else ms.slim(c)
+        conversation.update(ms.permissions(c))
         conversation["members"] = await ms.members(db, c, user)
     return {
         "conversation": conversation,
@@ -180,9 +176,33 @@ async def send_message(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Send a message (1-2000 characters, at most 20 a minute)."""
+    """Send a message (up to 2000 characters, at most 20 a minute), with up to 10 attachments.
+
+    The text may be empty when there are attachments. 403 "Only moderators can send messages
+    here" in a channel where I may not post. 422 for an attachment that isn't my own upload.
+    """
     c = await ms.open_conversation(db, conversation_id, str(user["id"]))
-    return await ms.send(db, c, user, body.body)
+    return await ms.send(db, c, user, body.body, body.attachments)
+
+
+@router.get("/conversations/{conversation_id}/library")
+async def conversation_library(
+    conversation_id: UUID,
+    tab: str = Query("media", pattern="^(media|links|docs)$"),
+    q: Optional[str] = Query(None, max_length=100),
+    limit: int = Query(30, ge=1, le=CURSOR_LIMIT_MAX),
+    cursor: Optional[str] = Query(None, max_length=500),
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """A thread's Media, Links or Docs, newest first. Same access as reading the thread.
+
+    Pages by keyset: pass `next_cursor` back as `cursor`.
+    """
+    await ms.open_conversation(db, conversation_id, str(user["id"]))
+    return await ms.library(
+        db, str(conversation_id), str(user["id"]), tab=tab, q=q, limit=limit, cursor=cursor
+    )
 
 
 @router.post("/conversations/{conversation_id}/read")
@@ -200,11 +220,12 @@ async def read_conversation(
 @router.patch("/{message_id}")
 async def edit_message(
     message_id: UUID,
-    body: MessageCreate,
+    body: MessageUpdate,
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Edit my own message (1-2000 characters) while I can still send in its conversation.
+    """Edit my own message (1-2000 characters; a message with attachments or an event may go
+    empty) while I can still send in its conversation.
 
     409 if it was deleted. Edits count toward the 20-a-minute limit; other people's open
     threads get the new text through `changed`.
@@ -218,27 +239,11 @@ async def delete_message(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """Delete my own message: it stays in the thread as "Message deleted", without its text.
+    """Delete my own message, or in a channel I manage, anyone's: it stays in the thread as
+    "Message deleted", without its text or attachments, and leaves the library.
 
     Other people's open threads get it through `changed`."""
-    row = (
-        await db.execute(
-            text("select sender_id, deleted_at from public.messages where id = :id"),
-            {"id": str(message_id)},
-        )
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Message not found")
-    if str(row["sender_id"]) != str(user["id"]):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only delete your own messages")
-    if row["deleted_at"] is None:
-        await db.execute(
-            text(
-                "update public.messages set deleted_at = now(), body = '', updated_at = now()"
-                " where id = :id"
-            ),
-            {"id": str(message_id)},
-        )
+    await ms.delete(db, message_id, user)
     return Response(status_code=204)
 
 

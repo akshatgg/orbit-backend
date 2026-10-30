@@ -1,11 +1,11 @@
-"""Delete Orbit's Cloudinary images once nothing uses them.
+"""Delete Orbit's Cloudinary images and chat files once nothing uses them.
 
 Mirrors the frontend's src/lib/cloudinary-release.ts. Call `release_images`
 right after permanently deleting events (or anything else that held an image
 URL), in the same session. Only images in Orbit's own `orbit/` folders of this
-Cloudinary account are touched, and only when no event, organiser, group or
-profile still references them (another date of the same series shares one
-cover, for instance).
+Cloudinary account are touched, and only when no event, organiser, group,
+profile or chat attachment still references them (another date of the same
+series shares one cover, for instance).
 """
 
 import asyncio
@@ -18,7 +18,7 @@ from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.uploads.service import orbit_image_public_id, sign_params
+from app.uploads.service import orbit_asset, sign_params
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,7 @@ _STILL_USED = text(
     " union select logo_url from organisers where logo_url = any(:urls)"
     " union select cover_url from groups where cover_url = any(:urls)"
     " union select avatar_url from profiles where avatar_url = any(:urls)"
+    " union select url from message_attachments where url = any(:urls)"
 )
 
 # Destroy tasks in flight, held so the event loop does not drop them.
@@ -34,7 +35,7 @@ _running: set[asyncio.Task] = set()
 
 
 async def release_images(db: AsyncSession, urls: Iterable[Optional[str]]) -> int:
-    """Schedule the Cloudinary deletion of the given images that are now unused.
+    """Schedule the Cloudinary deletion of the given images and files that are now unused.
 
     The reference check runs in the caller's transaction, so it sees the rows
     the caller just deleted as gone. The deletions themselves run only after
@@ -45,11 +46,11 @@ async def release_images(db: AsyncSession, urls: Iterable[Optional[str]]) -> int
     try:
         if not settings.cloudinary_configured:
             return 0
-        owned: dict[str, str] = {}  # url -> public id
+        owned: dict[str, tuple[str, str]] = {}  # url -> (resource type, public id)
         for url in urls:
-            public_id = orbit_image_public_id(url, settings.CLOUDINARY_CLOUD_NAME)
-            if url and public_id:
-                owned[url] = public_id
+            asset = orbit_asset(url, settings.CLOUDINARY_CLOUD_NAME)
+            if url and asset:
+                owned[url] = asset
         if not owned:
             return 0
 
@@ -57,7 +58,7 @@ async def release_images(db: AsyncSession, urls: Iterable[Optional[str]]) -> int
         async with db.begin_nested():
             result = await db.execute(_STILL_USED, {"urls": list(owned)})
             still_used = {row[0] for row in result}
-        unused = sorted({pid for url, pid in owned.items() if url not in still_used})
+        unused = sorted({asset for url, asset in owned.items() if url not in still_used})
         if unused:
             _destroy_after_commit(db, unused)
         return len(unused)
@@ -67,7 +68,7 @@ async def release_images(db: AsyncSession, urls: Iterable[Optional[str]]) -> int
         return 0
 
 
-def _destroy_after_commit(db: AsyncSession, public_ids: list[str]) -> None:
+def _destroy_after_commit(db: AsyncSession, assets: list[tuple[str, str]]) -> None:
     loop = asyncio.get_running_loop()
     session = db.sync_session
     state = {"settled": False}
@@ -77,7 +78,7 @@ def _destroy_after_commit(db: AsyncSession, public_ids: list[str]) -> None:
         if state["settled"] or sess.get_nested_transaction() is not None:
             return
         state["settled"] = True
-        task = loop.create_task(_destroy_all(public_ids))
+        task = loop.create_task(_destroy_all(assets))
         _running.add(task)
         task.add_done_callback(_running.discard)
 
@@ -88,20 +89,20 @@ def _destroy_after_commit(db: AsyncSession, public_ids: list[str]) -> None:
     event.listen(session, "after_rollback", on_rollback)
 
 
-async def _destroy_all(public_ids: list[str]) -> int:
+async def _destroy_all(assets: list[tuple[str, str]]) -> int:
     deleted = 0
-    for public_id in public_ids:
+    for resource_type, public_id in assets:
         try:
-            if await _destroy(public_id):
+            if await _destroy(public_id, resource_type):
                 deleted += 1
         except Exception:
             logger.exception("[cloudinary] destroy %s failed", public_id)
-    logger.info("[cloudinary] released %d of %d images", deleted, len(public_ids))
+    logger.info("[cloudinary] released %d of %d files", deleted, len(assets))
     return deleted
 
 
-async def _destroy(public_id: str) -> bool:
-    """Delete one image (and purge it from the CDN). True when Cloudinary says ok."""
+async def _destroy(public_id: str, resource_type: str = "image") -> bool:
+    """Delete one file (and purge it from the CDN). True when Cloudinary says ok."""
     timestamp = int(time.time())
     data = {
         "public_id": public_id,
@@ -113,7 +114,7 @@ async def _destroy(public_id: str) -> bool:
             settings.CLOUDINARY_API_SECRET or "",
         ),
     }
-    url = f"https://api.cloudinary.com/v1_1/{settings.CLOUDINARY_CLOUD_NAME}/image/destroy"
+    url = f"https://api.cloudinary.com/v1_1/{settings.CLOUDINARY_CLOUD_NAME}/{resource_type}/destroy"
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.post(url, data=data)
     try:
