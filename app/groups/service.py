@@ -606,23 +606,6 @@ async def remove_membership(db: AsyncSession, group_id: str, user_id: str) -> No
     )
 
 
-async def join_auto_groups(db: AsyncSession, user_id: Any) -> None:
-    """A new account joins every `auto_join` community and those communities' `auto_join` channels."""
-    await db.execute(
-        text(
-            """
-            insert into public.group_members (group_id, user_id, role)
-            select g.id, :u, 'member'
-              from public.groups g
-              left join public.groups parent on parent.id = g.parent_id
-             where g.auto_join and (g.kind = 'community' or parent.auto_join)
-            on conflict do nothing
-            """
-        ),
-        {"u": str(user_id)},
-    )
-
-
 # ─── members ────────────────────────────────────────────────────────────────
 
 
