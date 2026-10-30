@@ -5,11 +5,15 @@ upcoming) and were created since its `last_autopost_at`: up to 5 soonest as even
 then one system message "and N more new events" if there are more. A channel that has never
 been looked at starts from now, so nothing floods; the move script sets it for the same reason.
 
+Each Announcements channel then gets one summary: how many new events arrived per category, with
+a link for each (the category's channel, else its search). Nothing new, no summary.
+
 Then one bell notification per person per run, however many channels they're in; no email and
 no push. Everything is set-based, in one transaction: a second run finds nothing new, and a
 failure leaves no half-posted channels and never touches the import.
 """
 
+import json
 import logging
 from typing import Any
 
@@ -22,6 +26,18 @@ from app.groups.service import EVENT_VISIBLE, UPCOMING
 logger = logging.getLogger(__name__)
 
 MAX_POSTS_PER_CHANNEL = 5
+
+
+def _new_events(n: int) -> str:
+    return f"{n} new event{'' if n == 1 else 's'}"
+
+
+def _summary_href(r: Any) -> str:
+    if r["channel_slug"]:
+        return f"/communities/{r['parent_slug']}/{r['channel_slug']}"
+    if r["slug"]:
+        return f"/search?category={r['slug']}"
+    return "/search"
 
 
 def _more_line(n: int) -> str:
@@ -172,12 +188,124 @@ async def post_new_events(db: AsyncSession) -> dict[str, int]:
     }
 
 
+async def post_summaries(db: AsyncSession) -> dict[str, int]:
+    """One summary per Announcements channel, in the caller's transaction. A fixed number of
+    statements. Runs after `post_new_events`: both bells share the transaction's now(), which is
+    how someone who already got one is left out."""
+    rows = (
+        await db.execute(
+            text(
+                f"""
+                select a.id as group_id, parent.slug as parent_slug, cat.name, cat.slug, count(*) as n,
+                       (array_agg(e.cover_url order by e.starts_at, e.id)
+                          filter (where e.cover_url is not null))[1] as cover_url,
+                       (select ch.slug from public.groups ch
+                         where ch.parent_id = a.parent_id and ch.kind = 'channel'
+                           and ch.visibility = 'public' and e.category_id = any(ch.category_ids)
+                         order by ch.created_at limit 1) as channel_slug
+                  from public.groups a
+                  join public.groups parent on parent.id = a.parent_id
+                  join public.events e
+                    on e.created_at > coalesce(a.last_autopost_at, now()) and e.created_at <= now()
+                  left join public.organisers o on o.id = e.organiser_id
+                  left join public.categories cat on cat.id = e.category_id
+                 where a.is_announcements
+                   and e.status = 'published' and e.duplicate_of is null
+                   and (parent.university is null or lower(e.university) = lower(parent.university))
+                   and {UPCOMING} and {EVENT_VISIBLE}
+                 group by a.id, a.parent_id, parent.slug, cat.name, cat.slug, e.category_id
+                 order by n desc, cat.name
+                """
+            )
+        )
+    ).mappings().all()
+
+    by_group: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        by_group.setdefault(str(r["group_id"]), []).append(
+            {
+                "name": r["name"] or "Other",
+                "count": int(r["n"]),
+                "cover_url": r["cover_url"],
+                "href": _summary_href(r),
+            }
+        )
+    notified = 0
+    if by_group:
+        groups = list(by_group)
+        totals = [sum(c["count"] for c in by_group[g]) for g in groups]
+        await db.execute(
+            text(
+                """
+                insert into public.conversations (kind, group_id, created_by)
+                select 'channel', g.id, g.created_by
+                  from public.groups g where g.id = any(cast(:ids as uuid[]))
+                on conflict (group_id) do nothing
+                """
+            ),
+            {"ids": groups},
+        )
+        await db.execute(
+            text(
+                """
+                insert into public.messages (conversation_id, body, kind, data)
+                select c.id, x.body, 'summary', cast(x.data as jsonb)
+                  from unnest(cast(:groups as uuid[]), cast(:bodies as text[]), cast(:data as text[]))
+                         as x(group_id, body, data)
+                  join public.conversations c on c.group_id = x.group_id
+                """
+            ),
+            {
+                "groups": groups,
+                "bodies": [_new_events(n) for n in totals],
+                "data": [
+                    json.dumps({"total": n, "categories": by_group[g]})
+                    for g, n in zip(groups, totals)
+                ],
+            },
+        )
+        await db.execute(
+            text(
+                "update public.conversations set last_message_at = now()"
+                " where group_id = any(cast(:ids as uuid[]))"
+            ),
+            {"ids": groups},
+        )
+        notified = (
+            await db.execute(
+                text(
+                    """
+                    with sent as (
+                      insert into public.notifications (user_id, kind, title, link, group_id)
+                      select m.user_id, 'event_digest', x.title,
+                             '/communities/' || parent.slug || '/' || a.slug, parent.id
+                        from unnest(cast(:groups as uuid[]), cast(:titles as text[])) as x(group_id, title)
+                        join public.groups a on a.id = x.group_id
+                        join public.groups parent on parent.id = a.parent_id
+                        join public.group_members m on m.group_id = a.id
+                       where not exists (
+                         select 1 from public.notifications n
+                          where n.user_id = m.user_id and n.kind = 'event_digest' and n.created_at = now()
+                       )
+                      returning 1
+                    )
+                    select count(*) from sent
+                    """
+                ),
+                {"groups": groups, "titles": [f"{_new_events(n)} on ORBIT" for n in totals]},
+            )
+        ).scalar() or 0
+    await db.execute(text("update public.groups set last_autopost_at = now() where is_announcements"))
+    return {"summaries": len(by_group), "summary_notified": int(notified)}
+
+
 async def run_autopost() -> dict[str, Any]:
     """One run in its own transaction. Never raises: a failure is logged and reported back."""
     try:
         async with AsyncSessionLocal() as db:
             await db.execute(text("select set_config('app.trusted', 'on', true)"))
             summary = await post_new_events(db)
+            summary |= await post_summaries(db)
             await db.commit()
         logger.info("[cron/autopost] %s", summary)
         return summary
