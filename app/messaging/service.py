@@ -126,6 +126,7 @@ def message_out(r: Any, conversation_id: Optional[str] = None) -> dict[str, Any]
         "created_at": r["created_at"],
         "edited_at": r.get("edited_at"),
         "kind": r["kind"],
+        "data": None if deleted else r.get("data"),
         "event": None,
         "attachments": [],
         "links": [],
@@ -503,7 +504,7 @@ async def members(db: AsyncSession, c: dict[str, Any], me: dict) -> list[dict[st
 
 
 MESSAGE_COLUMNS = f"""
-    m.id, m.body, m.deleted_at, m.edited_at, m.created_at, m.kind, m.event_id,
+    m.id, m.body, m.deleted_at, m.edited_at, m.created_at, m.kind, m.event_id, m.data,
     {user_columns("m.sender_id", "p", "s_")}
 """
 
@@ -652,7 +653,7 @@ async def edit(db: AsyncSession, message_id: UUID, me: dict, body: str) -> dict[
                   update public.messages
                      set body = :b, edited_at = now(), updated_at = now()
                    where id = :id and deleted_at is null
-                  returning id, body, deleted_at, edited_at, created_at, sender_id, kind, event_id
+                  returning id, body, deleted_at, edited_at, created_at, sender_id, kind, event_id, data
                 ), logged as (
                   insert into public.message_edits (message_id, editor_id)
                   select id, sender_id from m
@@ -699,7 +700,7 @@ async def send(
                 with m as (
                   insert into public.messages (conversation_id, sender_id, body, kind)
                   values (:c, :me, :b, :kind)
-                  returning id, body, deleted_at, edited_at, created_at, sender_id, kind, event_id
+                  returning id, body, deleted_at, edited_at, created_at, sender_id, kind, event_id, data
                 ), touched as (
                   update public.conversations set last_message_at = (select created_at from m)
                    where id = :c

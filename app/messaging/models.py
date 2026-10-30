@@ -35,6 +35,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db_base import Base
@@ -121,6 +122,8 @@ class Message(Base):
     event_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("events.id", ondelete="SET NULL")
     )
+    # Summaries only: the rows of the card.
+    data: Mapped[dict | None] = mapped_column(JSONB)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -134,7 +137,7 @@ class Message(Base):
             " or char_length(body) >= 1)",
             name="messages_body_check",
         ),
-        CheckConstraint("kind in ('text','media','event','system')", name="messages_kind_check"),
+        CheckConstraint("kind in ('text','media','event','system','summary')", name="messages_kind_check"),
         Index("messages_conversation_idx", "conversation_id", text("created_at desc"), text("id desc")),
         Index("messages_sender_idx", "sender_id", "created_at"),
         Index(
