@@ -12,6 +12,12 @@ cd "$ROOT"
 # Short-lived token from the VM's service account; no credential helper needed.
 gcloud auth print-access-token \
   | docker login -u oauth2accesstoken --password-stdin https://us-central1-docker.pkg.dev >/dev/null
+
+# Every deploy leaves its image behind under its own commit tag, and `prune -f` only removes
+# untagged ones, so they piled up until the 20 GB disk filled ("no space left on device").
+# Drop every image no container uses before pulling; the running ones stay, and a rollback
+# pulls its tag from the registry again.
+docker image prune -af >/dev/null || true
 docker pull -q "$IMAGE"
 
 "$ROOT/bin/render-env"
@@ -31,5 +37,6 @@ if [ "$status" != healthy ]; then
   exit 1
 fi
 
-docker image prune -f >/dev/null
+# The image just replaced is unused now.
+docker image prune -af >/dev/null || true
 echo "[deploy] healthy: $IMAGE"
