@@ -1,4 +1,4 @@
-"""Cron endpoints: reminders and source refreshes."""
+"""Cron endpoints: reminders, source refreshes and the past-event cleanup."""
 
 from typing import Any
 
@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.deps import require_admin, require_cron
+from app.cron.cleanup import run_cleanup
 from app.cron.service import run_reminders
 from app.sources.service import start_refresh
 
@@ -35,3 +36,16 @@ async def refresh_sources_cron(_: None = Depends(require_cron)) -> dict[str, Any
 async def refresh_sources_admin(admin: dict = Depends(require_admin)) -> dict[str, Any]:
     """Start a refresh of every enabled source on an admin's request, in the background."""
     return {"started": start_refresh("manual")}
+
+
+@router.get("/cleanup-past-events")
+async def cleanup_past_events_cron(_: None = Depends(require_cron)) -> dict[str, Any]:
+    """Nightly from cron-job.org (cron secret): delete events dated before today and their Cloudinary covers,
+    only while the admin switch is on; otherwise `{ran: false, reason: "disabled"}`."""
+    return await run_cleanup("cron")
+
+
+@router.post("/cleanup-past-events")
+async def cleanup_past_events_admin(admin: dict = Depends(require_admin)) -> dict[str, Any]:
+    """"Run now" from the admin console: the same cleanup, whatever the switch says."""
+    return await run_cleanup("manual", admin["id"])

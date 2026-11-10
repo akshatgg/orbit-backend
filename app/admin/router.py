@@ -30,6 +30,7 @@ from app.admin.schemas import (
 from app.admin.service import create_event, import_csv, update_event
 from app.categories.models import Category
 from app.core.database import get_db
+from app.cron import cleanup as past_cleanup
 from app.core.deps import require_admin, require_super_admin
 from app.core.pagination import pagination
 from app.core.routing import NumbersRoute
@@ -1239,3 +1240,18 @@ async def admin_import_csv(
 ) -> dict[str, Any]:
     """Import CSV rows as published events, upserting on (source='csv', source_event_id)."""
     return await import_csv(db, body.rows, admin["id"])
+
+
+@router.get("/settings/past-event-cleanup")
+async def admin_past_event_cleanup(admin: dict = Depends(require_admin)) -> dict[str, Any]:
+    """The nightly past-event cleanup: whether it is on, its last run and how many events it
+    would delete now."""
+    return await past_cleanup.read_setting()
+
+
+@router.put("/settings/past-event-cleanup")
+async def admin_set_past_event_cleanup(
+    body: FeatureBody, admin: dict = Depends(require_admin)
+) -> dict[str, Any]:
+    """Turn the nightly past-event cleanup on or off (`{"on": true}`)."""
+    return await past_cleanup.set_enabled(body.on, admin["id"])

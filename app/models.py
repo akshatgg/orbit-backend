@@ -5,7 +5,7 @@ Importing this module registers every ORM model on the shared DeclarativeBase so
 """
 
 from app.db_base import Base  # noqa: F401
-from app.admin.models import AdminAuditLog  # noqa: F401
+from app.admin.models import AdminAuditLog, AppSetting  # noqa: F401
 from app.categories.models import Category  # noqa: F401
 from app.events.models import Event, EventPrivate  # noqa: F401
 from app.groups.models import (  # noqa: F401
