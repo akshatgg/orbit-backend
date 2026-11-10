@@ -33,3 +33,16 @@ class AdminAuditLog(Base):
         Index("admin_audit_log_created_idx", text("created_at desc")),
         Index("admin_audit_log_target_idx", "target_type", "target_id"),
     )
+
+
+class AppSetting(Base):
+    """Switches admins flip in the console, one JSON value per key
+    (e.g. `past_event_cleanup` → `{"enabled": true, "last_run": {...}}`)."""
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    value: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
